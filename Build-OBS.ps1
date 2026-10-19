@@ -1,4 +1,6 @@
 $ErrorActionPreference = 'Stop'
+# MSBuild (invoked by cmake --build) reports in UTF-8; decode accordingly.
+try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new() } catch { }
 $root = $PSScriptRoot.Replace('\','/')
 $env:ForceImportBeforeCppTargets = "$root/tools/LocalATL.props"
 # Do not let MSYS2's unrelated codec packages influence OBS dependency discovery.

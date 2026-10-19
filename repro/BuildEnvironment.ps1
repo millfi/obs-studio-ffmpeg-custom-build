@@ -40,7 +40,9 @@ function Get-BuildEnvironment {
     $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
     $vs = $null
     if (Test-Path $vswhere) {
-        $instances = @(& $vswhere -products '*' -version '[18.0,19.0)' -format json | ConvertFrom-Json)
+        # -utf8: vswhere otherwise emits the OEM code page when redirected and
+        # the localized "description" breaks JSON parsing on Japanese Windows.
+        $instances = @(& $vswhere -products '*' -version '[18.0,19.0)' -format json -utf8 | ConvertFrom-Json)
         if ($VSInstallPath) { $instances = @($instances | Where-Object installationPath -eq $VSInstallPath) }
         $vs = $instances | Select-Object -First 1
     }

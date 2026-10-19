@@ -62,24 +62,11 @@ $options = @(
     '--disable-decoder=libfdk_aac,av1_qsv,h264_qsv,hevc_qsv,mjpeg_qsv,mpeg2_qsv,vc1_qsv,vp8_qsv,vp9_qsv,vvc_qsv',
     '--disable-filter=deinterlace_qsv,overlay_qsv,scale_qsv,vpp_qsv,hstack_qsv,vstack_qsv,xstack_qsv'
 )
-# Encoder whitelist: --disable-encoders drops every built-in encoder and the
-# --enable-encoder list adds back only what OBS and the packaged ffmpeg.exe use.
-# configure matches *component* names, not runtime names, so the external
-# encoders appear as libvpx_vp8 / libvpx_vp9 / libaom_av1 (their runtime names
-# are libvpx / libvpx-vp9 / libaom-av1). A name that matches nothing only prints
-# a warning, hence the post-configure check below.
 $videoEncoders = @(
-    # H.264
-    'libx264'
-    'h264_nvenc', 'h264_amf', 'h264_qsv'
-    # HEVC
-    'hevc_nvenc', 'hevc_amf', 'hevc_qsv'
-    # AV1
-    'libsvtav1', 'libaom_av1'
-    'av1_nvenc', 'av1_amf', 'av1_qsv'
-    # VP8 / VP9
+    'libx264', 'h264_nvenc', 'h264_amf', 'h264_qsv'
+    'hevc_nvenc', 'hevc_amf', 'hevc_qsv', 'libsvtav1', 'libaom_av1', 'av1_nvenc', 'av1_amf', 'av1_qsv'
     'libvpx_vp8', 'libvpx_vp9'
-    # Lossless / intermediate: OBS's "Lossless" quality records with utvideo.
+    # Lossless / intermediate
     'ffv1', 'huffyuv', 'ffvhuff'
     'utvideo', 'prores_ks'
     # Not a real codec: the null muxer defaults to AV_CODEC_ID_WRAPPED_AVFRAME,
@@ -87,8 +74,6 @@ $videoEncoders = @(
     # decode check) needs this passthrough encoder.
     'wrapped_avframe'
 )
-# Audio encoders OBS registers: ffmpeg_aac, ffmpeg_opus, pcm_*, alac, flac, plus
-# libfdk_aac/libmp3lame/libvorbis for the bundled ffmpeg.exe.
 $audioEncoders = @(
     'libfdk_aac', 'aac'
     'libopus', 'libvorbis', 'libmp3lame'
@@ -96,8 +81,6 @@ $audioEncoders = @(
     'pcm_s16le', 'pcm_s24le', 'pcm_f32le'
 )
 # Appended last so the whitelist overrides the global disables above. The
-# former --disable-encoder=mjpeg_qsv,mpeg2_qsv,vp9_qsv line is redundant now:
-# only whitelisted encoders are built.
 $options += @(
     '--disable-encoders'
     "--enable-encoder=$(($videoEncoders + $audioEncoders) -join ',')"

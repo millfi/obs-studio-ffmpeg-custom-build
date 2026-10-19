@@ -117,6 +117,22 @@ function Download([string]$Url, [string]$Path, [string]$Sha256) {
     }
     if ((Get-FileHash $Path).Hash -ne $Sha256) { throw "Cached SHA256 mismatch: $Path" }
 }
+function Set-ConsoleEncoding([System.Text.Encoding]$Encoding, [int]$CodePage) {
+    # chcp also changes the code page that child processes inherit, which is
+    # what makes the nested "pwsh -Command" from Invoke-DevShell decode MSBuild
+    # output as UTF-8; the .NET setter only affects this process.
+    try { [Console]::OutputEncoding = $Encoding } catch { }
+    try { & chcp.com $CodePage *> $null } catch { }
+}
+# MSBuild, CMake and the other tools write UTF-8, while a Japanese Windows
+# console defaults to CP932 and PowerShell decodes native output with the
+# console code page, so their Japanese messages would reach the terminal and
+# logs/ as mojibake. Pin the console to UTF-8 for the build and restore it.
+$originalConsoleEncoding = [Console]::OutputEncoding
+$originalCodePage = 0
+try { $originalCodePage = [int]((& chcp.com) -replace '[^\d]', '') } catch { }
+if ($originalCodePage -le 0) { $originalCodePage = $originalConsoleEncoding.CodePage }
+Set-ConsoleEncoding ([System.Text.UTF8Encoding]::new()) 65001
 try {
     Stage sources {
         Source obs-studio https://github.com/obsproject/obs-studio.git b5bfb79093e26ce4b0e71d999f59b6b22f961121
@@ -209,5 +225,8 @@ try {
     Copy-Item fdk-aac/NOTICE "$package/licenses/fdk-aac/NOTICE" -Force
     Write-Host "SUCCESS: $package/Start-OBS.cmd"
     Write-Host 'QSV/NVENC/AMF encoders are registered. Actual encoding requires a compatible GPU and driver; no hardware success is inferred.'
-} finally { Set-Location $oldLocation }
+} finally {
+    Set-Location $oldLocation
+    Set-ConsoleEncoding $originalConsoleEncoding $originalCodePage
+}
 
