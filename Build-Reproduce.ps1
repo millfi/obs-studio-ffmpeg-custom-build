@@ -34,6 +34,39 @@ $originalCodePage = 0
 try { $originalCodePage = [int]((& chcp.com) -replace '[^\d]', '') } catch { }
 if ($originalCodePage -le 0) { $originalCodePage = $originalConsoleEncoding.CodePage }
 Set-ConsoleEncoding ([System.Text.UTF8Encoding]::new()) 65001
+# Console log colours (24-bit RGB). stderr of the build tools arrives as error
+# records and would render red even when it is only progress output, so every
+# log line is re-emitted through Write-LogLine and coloured by category:
+# downloads #0969DA, normal output #58606D, warnings #9A6700. Only lines that
+# really report a failure stay red (#CF222E).
+$ansi = [char]27
+$script:LogColors = @{
+    Download = "$ansi[38;2;9;105;218m"   # #0969DA
+    Normal   = "$ansi[38;2;88;96;109m"   # #58606D
+    Warning  = "$ansi[38;2;154;103;0m"   # #9A6700
+    Error    = "$ansi[38;2;207;34;46m"   # #CF222E
+}
+function Get-LogKind([string]$Line) {
+    if ($Line -match '(?i)(^\s*(error|fatal|failed|failure)\b|:\s*error\b|\berror [A-Z]{1,5}\d+|\berror\s+\d+\s*$|エラー|失敗)') { return 'Error' }
+    if ($Line -match '(?i)(warning(?!\s*\(s\))|警告)') { return 'Warning' }
+    if ($Line -match '(?i)(\[download\]|cloning into|remote:|from https?://|counting objects|compressing objects|enumerating objects|receiving objects|resolving deltas|unpacking objects|(?<![\\/])download|fetch)') { return 'Download' }
+    return 'Normal'
+}
+function Write-LogLine([string]$Line, [string]$Kind) {
+    if (!$Kind) { $Kind = Get-LogKind $Line }
+    Write-Host "$($script:LogColors[$Kind])$Line$ansi[0m"
+}
+function Invoke-Logged([scriptblock]$Action, [string]$LogFile) {
+    # One coloured line at a time keeps long builds streaming and leaves the
+    # log file free of ANSI escapes.
+    & $Action *>&1 | ForEach-Object {
+        $text = if ($_ -is [System.Management.Automation.InformationRecord]) { "$($_.MessageData)" } else { "$_" }
+        foreach ($line in ($text -split "`r?`n")) {
+            if ($LogFile) { Add-Content -LiteralPath $LogFile -Value $line }
+            Write-LogLine $line
+        }
+    }
+}
 # The only build output location. Keeping it fixed means the scripts below can
 # never be pointed at a directory that is tracked by git.
 $WorkRoot = Join-Path $PSScriptRoot 'work'
@@ -54,7 +87,7 @@ $PayloadFiles = @(
 )
 . (Join-Path $PSScriptRoot 'repro/BuildEnvironment.ps1')
 $tools = Get-BuildEnvironment -MsysRoot $MsysRoot -LLVMRoot $LLVMRoot -VSInstallPath $VSInstallPath
-Write-Host 'Required build tools: PASS'
+Write-LogLine 'Required build tools: PASS'
 if ($CheckTools) {
     $tools | Select-Object MsysRoot, LLVMRoot, MSVC, SDKRoot | Format-List
     Set-ConsoleEncoding $originalConsoleEncoding $originalCodePage
@@ -110,10 +143,12 @@ function Stage([string]$Name, [scriptblock]$Action) {
     $stamp = "$WorkRoot/.stages/$Name.json"
     if (Test-Path $stamp) {
         $previous = Get-Content $stamp -Raw | ConvertFrom-Json
-        if ($previous.script_sha256 -eq $scriptHash) { Write-Host "[SKIP] $Name (completed)"; return }
+        if ($previous.script_sha256 -eq $scriptHash) { Write-LogLine "[SKIP] $Name (completed)"; return }
     }
-    Write-Host "[BUILD] $Name"
-    & $Action *>&1 | Tee-Object -FilePath "$WorkRoot/logs/$Name.log"
+    Write-LogLine "[BUILD] $Name"
+    $log = "$WorkRoot/logs/$Name.log"
+    [IO.File]::WriteAllText($log, '')
+    Invoke-Logged $Action $log
     @{script_sha256=$scriptHash;completed_utc=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json | Set-Content $stamp
 }
 function Source([string]$Name, [string]$Url, [string]$Commit) {
@@ -129,6 +164,7 @@ function Source([string]$Name, [string]$Url, [string]$Commit) {
 }
 function Download([string]$Url, [string]$Path, [string]$Sha256) {
     if (!(Test-Path $Path)) {
+        Write-LogLine "[DOWNLOAD] $Url" Download
         Invoke-WebRequest -Uri $Url -OutFile "$Path.partial" -MaximumRetryCount 3
         if ((Get-FileHash "$Path.partial").Hash -ne $Sha256) { throw "SHA256 mismatch: $Url" }
         Move-Item -LiteralPath "$Path.partial" -Destination $Path
@@ -199,7 +235,7 @@ try {
         Push-Location ffmpeg
         try { foreach ($item in $Patches) { Safe-Patch @item } } finally { Pop-Location }
     }
-    if ($PrepareOnly) { Write-Host "Preparation complete: $WorkRoot"; return }
+    if ($PrepareOnly) { Write-LogLine "Preparation complete: $WorkRoot"; return }
     Stage fdk {
         Exec cmake -S fdk-aac -B build/fdk -G 'Visual Studio 18 2026' -A x64 -DBUILD_SHARED_LIBS=OFF "-DCMAKE_INSTALL_PREFIX=$WorkRoot/local"
         Exec cmake --build build/fdk --config Release --parallel 6
@@ -216,17 +252,17 @@ try {
     Stage obs { Exec pwsh -NoProfile -File "$WorkRoot/Build-OBS.ps1" }
     Stage ffmpeg { Exec pwsh -NoProfile -File "$WorkRoot/Build-FFmpeg.ps1" }
     # Packaging and validation always run; they are intentionally not skipped on resume.
-    Exec pwsh -NoProfile -File "$WorkRoot/Package-OBS.ps1"
-    Exec cmake -S verification -B build/verification -G 'Visual Studio 18 2026' -A x64
-    Exec cmake --build build/verification --config Release --parallel 4
-    Exec pwsh -NoProfile -File "$WorkRoot/verification/Verify-Package.ps1"
+    Invoke-Logged { Exec pwsh -NoProfile -File "$WorkRoot/Package-OBS.ps1" }
+    Invoke-Logged { Exec cmake -S verification -B build/verification -G 'Visual Studio 18 2026' -A x64 }
+    Invoke-Logged { Exec cmake --build build/verification --config Release --parallel 4 }
+    Invoke-Logged { Exec pwsh -NoProfile -File "$WorkRoot/verification/Verify-Package.ps1" }
     $package = "$WorkRoot/OBS-Studio-FDK-QSV"
     if (!(Test-Path "$package/portable_mode") -or (Get-Item "$package/portable_mode").Length -ne 0) { throw 'Portable marker validation failed.' }
     New-Item -ItemType Directory -Force "$package/build-info", "$package/licenses/fdk-aac" | Out-Null
     Copy-Item verification/source-commits.json,verification/build-tools.json,verification/encoders-diff.json,verification/decoders-diff.json "$package/build-info" -Force
     Copy-Item fdk-aac/NOTICE "$package/licenses/fdk-aac/NOTICE" -Force
-    Write-Host "SUCCESS: $package/Start-OBS.cmd"
-    Write-Host 'QSV/NVENC/AMF encoders are registered. Actual encoding requires a compatible GPU and driver; no hardware success is inferred.'
+    Write-LogLine "SUCCESS: $package/Start-OBS.cmd"
+    Write-LogLine 'QSV/NVENC/AMF encoders are registered. Actual encoding requires a compatible GPU and driver; no hardware success is inferred.' Warning
 } finally {
     Set-Location $oldLocation
     Set-ConsoleEncoding $originalConsoleEncoding $originalCodePage
