@@ -3,13 +3,13 @@
 Build the pinned Windows x64 OBS + FDK AAC + FFmpeg QSV portable distribution.
 .DESCRIPTION
 Multi-file source layout: keep this script and the extracted source files together.
-Downloads source/development dependencies, never installs system tools. Existing unrelated
-directories are refused. Re-run with the same WorkRoot to resume completed stages.
-The resulting program/configuration is reproduced, not a byte-for-byte reproducible binary.
+Downloads source/development dependencies, never installs system tools. Everything is
+generated in ./work next to this script, which is git-ignored; re-run the script to resume
+completed stages. The resulting program/configuration is reproduced, not a byte-for-byte
+reproducible binary.
 #>
 [CmdletBinding()]
 param(
-    [string]$WorkRoot = (Join-Path $PSScriptRoot 'repro-build'),
     [string]$MsysRoot,
     [string]$LLVMRoot,
     [string]$VSInstallPath,
@@ -17,6 +17,9 @@ param(
     [switch]$PrepareOnly
 )
 $ErrorActionPreference = 'Stop'
+# The only build output location. Keeping it fixed means the scripts below can
+# never be pointed at a directory that is tracked by git.
+$WorkRoot = Join-Path $PSScriptRoot 'work'
 # Reviewable source files live alongside this entry point. They are copied into
 # WorkRoot so the original build scripts retain their PSScriptRoot semantics.
 $PayloadFiles = @(
@@ -40,9 +43,9 @@ if ($CheckTools) {
     return
 }
 $WorkRoot = [IO.Path]::GetFullPath($WorkRoot).Replace('\','/')
-if ($WorkRoot -notmatch '^[A-Za-z]:/[A-Za-z0-9_./-]+$') { throw 'Use a local ASCII work path without spaces, for example -WorkRoot C:/obs-repro. The upstream FFmpeg/obs-deps recipes require this.' }
+if ($WorkRoot -notmatch '^[A-Za-z]:/[A-Za-z0-9_./-]+$') { throw "The build path must be local, ASCII and space-free (the upstream FFmpeg/obs-deps recipes require it): $WorkRoot. Move the checkout to such a path." }
 if (Test-Path $WorkRoot) {
-    if (!(Test-Path "$WorkRoot/.obs-repro-owned.json") -and @(Get-ChildItem $WorkRoot -Force).Count) { throw "WorkRoot must be empty or previously created by this script: $WorkRoot" }
+    if (!(Test-Path "$WorkRoot/.obs-repro-owned.json") -and @(Get-ChildItem $WorkRoot -Force).Count) { throw "Refusing to write into a non-empty directory that this script did not create: $WorkRoot" }
 }
 # Preserve the original resume behaviour while tracking edits to *any* source
 # file. A change to a payload invalidates the completed-stage stamps.
