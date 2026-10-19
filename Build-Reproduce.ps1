@@ -17,6 +17,23 @@ param(
     [switch]$PrepareOnly
 )
 $ErrorActionPreference = 'Stop'
+function Set-ConsoleEncoding([System.Text.Encoding]$Encoding, [int]$CodePage) {
+    # chcp also changes the code page that child processes inherit, which is
+    # what makes the nested "pwsh -Command" from Invoke-DevShell decode MSBuild
+    # output as UTF-8; the .NET setter only affects this process.
+    try { [Console]::OutputEncoding = $Encoding } catch { }
+    try { & chcp.com $CodePage *> $null } catch { }
+}
+# MSBuild, CMake and vswhere write UTF-8, while a Japanese Windows console
+# defaults to CP932 and PowerShell decodes native output with the console code
+# page; their Japanese messages would then reach the terminal and logs/ as
+# mojibake and the vswhere JSON would not even parse. Pin the console to UTF-8
+# before the first tool runs and restore the original setting at the end.
+$originalConsoleEncoding = [Console]::OutputEncoding
+$originalCodePage = 0
+try { $originalCodePage = [int]((& chcp.com) -replace '[^\d]', '') } catch { }
+if ($originalCodePage -le 0) { $originalCodePage = $originalConsoleEncoding.CodePage }
+Set-ConsoleEncoding ([System.Text.UTF8Encoding]::new()) 65001
 # The only build output location. Keeping it fixed means the scripts below can
 # never be pointed at a directory that is tracked by git.
 $WorkRoot = Join-Path $PSScriptRoot 'work'
@@ -40,6 +57,7 @@ $tools = Get-BuildEnvironment -MsysRoot $MsysRoot -LLVMRoot $LLVMRoot -VSInstall
 Write-Host 'Required build tools: PASS'
 if ($CheckTools) {
     $tools | Select-Object MsysRoot, LLVMRoot, MSVC, SDKRoot | Format-List
+    Set-ConsoleEncoding $originalConsoleEncoding $originalCodePage
     return
 }
 $WorkRoot = [IO.Path]::GetFullPath($WorkRoot).Replace('\','/')
@@ -117,22 +135,6 @@ function Download([string]$Url, [string]$Path, [string]$Sha256) {
     }
     if ((Get-FileHash $Path).Hash -ne $Sha256) { throw "Cached SHA256 mismatch: $Path" }
 }
-function Set-ConsoleEncoding([System.Text.Encoding]$Encoding, [int]$CodePage) {
-    # chcp also changes the code page that child processes inherit, which is
-    # what makes the nested "pwsh -Command" from Invoke-DevShell decode MSBuild
-    # output as UTF-8; the .NET setter only affects this process.
-    try { [Console]::OutputEncoding = $Encoding } catch { }
-    try { & chcp.com $CodePage *> $null } catch { }
-}
-# MSBuild, CMake and the other tools write UTF-8, while a Japanese Windows
-# console defaults to CP932 and PowerShell decodes native output with the
-# console code page, so their Japanese messages would reach the terminal and
-# logs/ as mojibake. Pin the console to UTF-8 for the build and restore it.
-$originalConsoleEncoding = [Console]::OutputEncoding
-$originalCodePage = 0
-try { $originalCodePage = [int]((& chcp.com) -replace '[^\d]', '') } catch { }
-if ($originalCodePage -le 0) { $originalCodePage = $originalConsoleEncoding.CodePage }
-Set-ConsoleEncoding ([System.Text.UTF8Encoding]::new()) 65001
 try {
     Stage sources {
         Source obs-studio https://github.com/obsproject/obs-studio.git b5bfb79093e26ce4b0e71d999f59b6b22f961121
