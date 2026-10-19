@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.28)
+project(VerifyOBS C)
+set(ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
+add_executable(verify-obs verify-obs.c)
+target_include_directories(verify-obs PRIVATE "${ROOT}/obs-studio/libobs" "${ROOT}/obs-studio/build_x64/config" "${ROOT}/obs-studio/.deps/obs-deps-2026-08-26-x64/include")
+target_link_libraries(verify-obs PRIVATE "${ROOT}/obs-studio/build_x64/libobs/RelWithDebInfo/obs.lib" "${ROOT}/obs-studio/.deps/obs-deps-2026-08-26-x64/lib/avcodec.lib")

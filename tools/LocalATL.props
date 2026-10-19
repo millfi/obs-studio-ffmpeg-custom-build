@@ -1,0 +1,11 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <LocalATLRoot>$(MSBuildThisFileDirectory)atl\Contents\VC\Tools\MSVC\14.51.36231\atlmfc</LocalATLRoot>
+    <LocalATLArch Condition="'$(Platform)' == 'Win32'">x86</LocalATLArch>
+    <LocalATLArch Condition="'$(Platform)' == 'x64'">x64</LocalATLArch>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile><AdditionalIncludeDirectories>$(LocalATLRoot)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile>
+    <Link><AdditionalLibraryDirectories>$(LocalATLRoot)\lib\$(LocalATLArch);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories></Link>
+  </ItemDefinitionGroup>
+</Project>

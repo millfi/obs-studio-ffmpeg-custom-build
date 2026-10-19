@@ -1,0 +1,8 @@
+# Store and check out the payload with LF endings only.
+#
+# EXTRACTED-FILES.sha256 pins the SHA256 of every tracked source file and
+# Build-Reproduce.ps1 derives its stage fingerprints from the same bytes, so a
+# line-ending conversion would silently change those hashes. The Git for
+# Windows system config on this machine sets core.autocrlf=true, hence the
+# explicit eol=lf.
+* text=auto eol=lf
