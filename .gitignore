@@ -18,6 +18,9 @@
 /OBS-Studio-FDK-QSV/
 /tools/atl/
 
+# Downloaded source/dependency archives (Download-Sources.ps1 output).
+/source-cache/
+
 # Upstream checkouts, plus the dependency archives unpacked into them.
 /fdk-aac/
 /ffmpeg/

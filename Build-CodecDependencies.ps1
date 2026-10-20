@@ -1,6 +1,13 @@
 # libtheora is intentionally absent: the FFmpeg encoder whitelist does not build
 # its encoder, so building the library would add an unused DLL and import lib.
-param([string[]]$Dependencies = @('opus','libogg','libvorbis','libvpx','svt-av1','aom','lame'))
+param(
+    [string[]]$Dependencies = @('opus','libogg','libvorbis','libvpx','svt-av1','aom','lame'),
+    # Download-Sources.ps1 runs Setup only (download + unpack, no build) and
+    # packs the resulting trees into the source cache; the offline build
+    # restores them and starts at Patch.
+    [switch]$DownloadOnly,
+    [switch]$SkipSetup
+)
 $ErrorActionPreference = 'Stop'
 # MSBuild reports warnings and errors in UTF-8; decode it as such instead of
 # with the Japanese console code page (Build-Reproduce.ps1 pins the console).
@@ -48,7 +55,10 @@ foreach ($dep in $Dependencies) {
         . $scriptFile.FullName
         $Path = [IO.Path]::GetFileNameWithoutExtension($Uri)
         $script:StageName = $Name
-        foreach ($stage in @('Setup','Patch','Configure','Build','Install','Fixup')) {
+        $stages = if ($DownloadOnly) { @('Setup') }
+                  elseif ($SkipSetup) { @('Patch','Configure','Build','Install','Fixup') }
+                  else { @('Setup','Patch','Configure','Build','Install','Fixup') }
+        foreach ($stage in $stages) {
             Set-Location $WorkRoot
             if (Test-Path "function:$stage") {
                 Write-Host "=== $dep : $stage ==="
@@ -60,9 +70,13 @@ foreach ($dep in $Dependencies) {
                 } else {
                     & $stage
                 }
-                if ($dep -eq 'libvpx' -and $stage -eq 'Setup') {
-                    # A clean tree generates .vcxproj during make, after Configure.
-                    # Retarget the generator as well as any already generated projects.
+                # A clean tree generates .vcxproj during make, after Configure.
+                # Retarget the generator as well as any already generated
+                # projects. The replace is idempotent, so it is fine that this
+                # runs after Setup on a full build and after Configure on a
+                # -SkipSetup build (where Setup, and with it this hook, is gone).
+                # Never run in -DownloadOnly mode: the cached tree stays pristine.
+                if ($dep -eq 'libvpx' -and !$DownloadOnly -and $stage -in @('Setup','Configure')) {
                     $generator = "$WorkRoot/libvpx-$Version/build/make/gen_msvs_vcxproj.sh"
                     [IO.File]::WriteAllText($generator, ([IO.File]::ReadAllText($generator).Replace('PlatformToolset v143','PlatformToolset v145')))
                 }

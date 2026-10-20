@@ -39,10 +39,59 @@ $options += @(
     "--enable-encoder=$(($videoEncoders + $audioEncoders) -join ',')"
 )
 ```
-# Build
+# バージョン宣言 (sources.psd1 / sources.lock)
+バージョンの指定は Cargo と同じ「宣言ファイル + ロックファイル」方式です。
+
+| ファイル | 役割 |
+| --- | --- |
+| `sources.psd1` | 人が編集する宣言。`'fdk-aac' = 'v2.0.3'` のようにタグ・ブランチ・コミットを書く |
+| `sources.lock` | 自動生成。解決済みコミットとアーカイブのSHA256を記録(ビルドはこれだけを読む) |
+| `source-cache\` | 実体の7zアーカイブ(バージョン管理対象外) |
+
+```PowerShell
+# バージョン変更: sources.psd1 の該当行を書き換えるだけ
+#   'fdk-aac' = 'v2.0.3'
+
+# 変更された項目だけ解決・再取得し、sources.lock を更新
+pwsh -executionpolicy bypass .\Download-Sources.ps1
+# 特定の項目だけ更新 (cargo update -p 相当)
+pwsh -executionpolicy bypass .\Download-Sources.ps1 -Package fdk-aac
+```
+宣言を書き換えただけではビルド結果は変わりません(lock が契約)。`Download-Sources.ps1` を実行して初めてビルドに反映されます。
+
+# ダウンロードとビルドの分離
+依存関係の取得(オンライン)とビルド(オフライン)は別コマンドに分離されています。
+
+## ダウンロード(オンライン)
+```PowerShell
+pwsh -executionpolicy bypass .\Download-Sources.ps1
+```
+`source-cache\` に必要なソース・依存関係をすべて 7z(Zstandard圧縮)で格納します。`sources.lock` に各アーカイブのSHA256が記録され、ビルド前に検証されます。
+| アーカイブ | 内容 |
+| --- | --- |
+| `git-<リポジトリ>.7z` | gitチェックアウト(.git履歴込み。OBS/FFmpegのバージョン文字列の再現に必要) |
+| `codec-sources.7z` | obs-depsレシピ経由で取得したcodecソースツリー(opus/libogg/libvorbis/libvpx/svt-av1/aom/lame) |
+| `atl.7z` | ATL開発用VSIX |
+| `official-dependencies.7z` | OBS公式prebuilt依存(Windows deps / Qt6 / CEF) |
+
+`sources.lock` と一致するアーカイブはスキップされるため、中断しても再実行で続きから取得できます。主なオプション:
+
+| オプション | 動作 |
+| --- | --- |
+| `-Package <名前>` | 指定項目だけ再解決・再取得(cargo update -p 相当) |
+| `-Update` | 全宣言を再解決(ブランチが進んだ場合など) |
+| `-Locked` | lock が古ければエラーにし、取得もlock更新もしない |
+| `-Force` | lock が最新でも全アーカイブを作り直す |
+| `-SourceCache <path>` | 格納先の変更(既定: `.\source-cache`) |
+
+アーカイブの合計サイズは約750MBです。
+
+## ビルド(オフライン)
+`source-cache\` と `sources.lock` をスクリプトと同じ場所(または `-SourceCache` で指定した場所)に置いて:
 ```PowerShell
 pwsh -executionpolicy bypass .\Build-Reproduce.ps1
 ```
+7z(Zstandard対応、例: 7-Zip ZS)が必要です。その他必要なツールは従来通りです。`sources.lock` のハッシュが変わると全ステージが再実行されます。
 # OBS Binary Location
 ```
 

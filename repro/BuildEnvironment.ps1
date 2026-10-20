@@ -4,7 +4,9 @@ function Get-BuildEnvironment {
     if ($PSVersionTable.PSVersion -lt [version]'7.2') { $missing.Add('PowerShell 7.2 or newer (run with pwsh.exe).') }
     if (!$IsWindows -or ![Environment]::Is64BitProcess) { $missing.Add('64-bit Windows and 64-bit PowerShell are required.') }
     $commands = @{}
-    foreach ($name in @('cmake','git','ninja','pwsh','robocopy')) {
+    # 7z extracts the source cache; its Zstandard support is checked by
+    # Get-SevenZip in repro/SourceCache.ps1.
+    foreach ($name in @('cmake','git','ninja','pwsh','robocopy','7z')) {
         $found = Get-Command "$name.exe" -ErrorAction SilentlyContinue
         if ($found) { $commands[$name] = $found.Source } else { $missing.Add("$name.exe must be on PATH.") }
     }

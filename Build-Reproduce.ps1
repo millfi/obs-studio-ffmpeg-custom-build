@@ -3,16 +3,19 @@
 Build the pinned Windows x64 OBS + FDK AAC + FFmpeg QSV portable distribution.
 .DESCRIPTION
 Multi-file source layout: keep this script and the extracted source files together.
-Downloads source/development dependencies, never installs system tools. Everything is
-generated in ./work next to this script, which is git-ignored; re-run the script to resume
-completed stages. The resulting program/configuration is reproduced, not a byte-for-byte
-reproducible binary.
+Runs fully offline: every source and development dependency is read from the
+source cache (./source-cache by default) that Download-Sources.ps1 filled with
+7-Zip (Zstandard) archives on a networked machine. No tools are ever installed.
+Everything is generated in ./work next to this script, which is git-ignored;
+re-run the script to resume completed stages. The resulting
+program/configuration is reproduced, not a byte-for-byte reproducible binary.
 #>
 [CmdletBinding()]
 param(
     [string]$MsysRoot,
     [string]$LLVMRoot,
     [string]$VSInstallPath,
+    [string]$SourceCache,
     [switch]$CheckTools,
     [switch]$PrepareOnly
 )
@@ -78,6 +81,7 @@ $PayloadFiles = @(
     'Build-CodecDependencies.ps1',
     'Package-OBS.ps1',
     'repro/BuildEnvironment.ps1',
+    'repro/SourceCache.ps1',
     'repro/UpstreamAdapters.ps1',
     'tools/LocalATL.props',
     'verification/CMakeLists.txt',
@@ -86,6 +90,8 @@ $PayloadFiles = @(
     'verification/Verify-Package.ps1'
 )
 . (Join-Path $PSScriptRoot 'repro/BuildEnvironment.ps1')
+. (Join-Path $PSScriptRoot 'repro/SourceCache.ps1')
+Get-SevenZip | Out-Null
 $tools = Get-BuildEnvironment -MsysRoot $MsysRoot -LLVMRoot $LLVMRoot -VSInstallPath $VSInstallPath
 Write-LogLine 'Required build tools: PASS'
 if ($CheckTools) {
@@ -93,15 +99,26 @@ if ($CheckTools) {
     Set-ConsoleEncoding $originalConsoleEncoding $originalCodePage
     return
 }
+if (!$SourceCache) { $SourceCache = Join-Path $PSScriptRoot 'source-cache' }
+$SourceCache = [IO.Path]::GetFullPath($SourceCache)
+$lock = Test-SourceLock $PSScriptRoot $SourceCache
+Write-LogLine "Sources lock: PASS ($(@($lock.sources).Count) sources, $(@($lock.downloads).Count) downloads, $SourceCache)"
 $WorkRoot = [IO.Path]::GetFullPath($WorkRoot).Replace('\','/')
 if ($WorkRoot -notmatch '^[A-Za-z]:/[A-Za-z0-9_./-]+$') { throw "The build path must be local, ASCII and space-free (the upstream FFmpeg/obs-deps recipes require it): $WorkRoot. Move the checkout to such a path." }
 if (Test-Path $WorkRoot) {
     if (!(Test-Path "$WorkRoot/.obs-repro-owned.json") -and @(Get-ChildItem $WorkRoot -Force).Count) { throw "Refusing to write into a non-empty directory that this script did not create: $WorkRoot" }
 }
 # Preserve the original resume behaviour while tracking edits to *any* source
-# file. A change to a payload invalidates the completed-stage stamps.
+# file. A change to a payload invalidates the completed-stage stamps. The build
+# never reads sources.psd1: sources.lock is the contract with the download step,
+# so its hash belongs in the fingerprint.
+$lockPath = Get-SourceLockPath $PSScriptRoot
+if (!(Test-Path -LiteralPath $lockPath)) {
+    throw "sources.lock is missing: $lockPath. Run Download-Sources.ps1 on a networked machine first."
+}
 $fingerprintLines = @(
     'entry-point|{0}' -f (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+    'sources.lock|{0}' -f (Get-FileHash -LiteralPath $lockPath -Algorithm SHA256).Hash
     foreach ($relative in ($PayloadFiles | Sort-Object -Unique)) {
         $sourcePath = Join-Path $PSScriptRoot $relative
         if (!(Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
@@ -151,77 +168,51 @@ function Stage([string]$Name, [scriptblock]$Action) {
     Invoke-Logged $Action $log
     @{script_sha256=$scriptHash;completed_utc=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json | Set-Content $stamp
 }
-function Source([string]$Name, [string]$Url, [string]$Commit) {
-    if (!(Test-Path "$Name/.git")) { Exec git init $Name }
-    if ('origin' -notin @(& git -C $Name remote)) { Exec git -C $Name remote add origin $Url }
-    $head = & git -C $Name rev-parse --verify HEAD 2>$null
-    if ($head -ne $Commit) {
-        if ($head) { throw "Refusing to overwrite existing $Name commit $head (expected $Commit)." }
-        Exec git -C $Name fetch --depth 1 origin $Commit
-        Exec git -C $Name checkout --detach $Commit
-    }
-    if ((& git -C $Name rev-parse HEAD) -ne $Commit) { throw "Commit verification failed: $Name" }
+function Expand-Cache([string]$Name, [string]$Destination) {
+    Write-LogLine "[CACHE] $Name -> $Destination" Download
+    Expand-SourceArchive "$SourceCache/$Name" $Destination
 }
-function Download([string]$Url, [string]$Path, [string]$Sha256) {
-    if (!(Test-Path $Path)) {
-        Write-LogLine "[DOWNLOAD] $Url" Download
-        Invoke-WebRequest -Uri $Url -OutFile "$Path.partial" -MaximumRetryCount 3
-        if ((Get-FileHash "$Path.partial").Hash -ne $Sha256) { throw "SHA256 mismatch: $Url" }
-        Move-Item -LiteralPath "$Path.partial" -Destination $Path
-    }
-    if ((Get-FileHash $Path).Hash -ne $Sha256) { throw "Cached SHA256 mismatch: $Path" }
+function Assert-CachedFile([string]$Path, [string]$Sha256) {
+    # Re-checks the pinned hash of a file restored from the source cache.
+    if (!(Test-Path -LiteralPath $Path)) { throw "Missing file restored from the source cache: $Path" }
+    if ((Get-FileHash -LiteralPath $Path).Hash -ne $Sha256) { throw "SHA256 mismatch: $Path" }
 }
 try {
     Stage sources {
-        Source obs-studio https://github.com/obsproject/obs-studio.git b5bfb79093e26ce4b0e71d999f59b6b22f961121
-        Exec git -C obs-studio submodule update --init --recursive
-        # Include the nearest tag so OBS derives exactly the same version string.
-        Exec git -C obs-studio fetch --depth 200 origin tag 32.2.1
-        Exec git -C obs-studio fetch --deepen 200 origin b5bfb79093e26ce4b0e71d999f59b6b22f961121
-        Exec git -C obs-studio config core.abbrev 9
-        Source fdk-aac https://github.com/mstorsjo/fdk-aac.git 7c83d08002332b2730c845eec3497e6bf585dd28
-        Source ffmpeg https://github.com/FFmpeg/FFmpeg.git 38b88335f99e76ed89ff3c93f877fdefce736c13
-        Exec git -C ffmpeg fetch --depth 1 origin tag n8.1.2
-        Source obs-deps https://github.com/obsproject/obs-deps.git f80e1d30181b0ff2b048b6d8fe8b8c501f3d221c
-        Source libvpl https://github.com/intel/libvpl.git 674d015bcb294bc39fa276e99a652ea045423e82
         $commits = [ordered]@{}
-        foreach ($repo in @('obs-studio','fdk-aac','ffmpeg','obs-deps','libvpl')) { $commits[$repo] = & git -C $repo rev-parse HEAD }
+        foreach ($repo in Get-LockedRepositories $lock) {
+            Expand-Cache "git-$($repo.Name).7z" $WorkRoot
+            $head = & git -C $repo.Name rev-parse HEAD
+            if ($head -ne $repo.Commit) { throw "Source cache commit mismatch: $($repo.Name) is $head, expected $($repo.Commit)." }
+            if ($repo.CoreAbbrev) { Exec git -C $repo.Name config core.abbrev $repo.CoreAbbrev }
+            $commits[$repo.Name] = $head
+        }
+        # Offline integrity check: every submodule must be checked out at the
+        # commit the pinned obs-studio tree records.
+        $submodules = & git -C obs-studio submodule status --recursive
+        if ($LASTEXITCODE) { throw 'git submodule status failed' }
+        $bad = @($submodules | Where-Object { $_ -match '^[+-U]' })
+        if ($bad.Count) { throw "obs-studio submodules are not fully checked out in the source cache:`n$($bad -join "`n")" }
         $commits | ConvertTo-Json | Set-Content verification/source-commits.json
     }
     Stage atl {
-        $base = 'https://download.visualstudio.microsoft.com/download/pr/a62262cf-b9f6-4770-9454-7372ad8fcec0'
-        $hashes = @{
-            Headers='df87bd5da5bb3d101ca8238cc4d5f90d648336202c41f2ab80b5549b7ac495d1'
-            X64='6bf1c9950675fe9e5f46d861663ae19abcd18ce8e28602675194c32550ab3b04'
-            X86='935a0f126b0c5a1f356103dabd2c8b6c74a1f6fa8292982ff7e8a4230d86fb50'
-        }
-        foreach ($part in $hashes.Keys) {
-            $file = "Microsoft.VC.14.51.ATL.$part.base.vsix"
-            Download "$base/$($hashes[$part])/$file" "downloads/$file" $hashes[$part]
+        $atl = Get-PinnedAtl
+        Expand-Cache 'atl.7z' "$WorkRoot/downloads"
+        foreach ($part in $atl.Files.Keys) {
+            $file = Get-PinnedAtlFileName $part
+            Assert-CachedFile "$WorkRoot/downloads/$file" $atl.Files[$part]
             Expand-Archive -LiteralPath "downloads/$file" -DestinationPath tools/atl -Force
         }
     }
     Stage official-dependencies {
-        $presets = Get-Content obs-studio/CMakePresets.json -Raw | ConvertFrom-Json
-        $dependencies = ($presets.configurePresets | Where-Object name -eq dependencies).vendor.'obsproject.com/obs-studio'.dependencies
-        $specs = @(
-            @('prebuilt','x64','windows-deps-{0}-x64.zip','obs-deps-{0}-x64'),
-            @('prebuilt','x86','windows-deps-{0}-x86.zip','obs-deps-{0}-x86'),
-            @('qt6','x64','windows-deps-qt6-{0}-x64.zip','obs-deps-qt6-{0}-x64'),
-            @('cef','x64','cef_binary_{0}_windows_x64.zip','cef_binary_{0}_windows_x64')
-        )
-        New-Item -ItemType Directory -Force obs-studio/.deps | Out-Null
-        foreach ($spec in $specs) {
-            $dep = $dependencies.($spec[0]); $arch = $spec[1]
-            $filename = $spec[2] -f $dep.version; $destination = $spec[3] -f $dep.version
-            $url = if ($spec[0] -eq 'cef') { "$($dep.baseUrl)/$filename" } else { "$($dep.baseUrl)/$($dep.version)/$filename" }
-            $hash = $dep.hashes."windows-$arch"
-            Download $url "obs-studio/.deps/$filename" $hash
-            $target = "$WorkRoot/obs-studio/.deps/$destination"
+        Expand-Cache 'official-dependencies.7z' "$WorkRoot/obs-studio/.deps"
+        foreach ($dep in (Get-OfficialDependencySpecs "$WorkRoot/obs-studio")) {
+            Assert-CachedFile "$WorkRoot/obs-studio/.deps/$($dep.FileName)" $dep.Hash
+            $target = "$WorkRoot/obs-studio/.deps/$($dep.Destination)"
             New-Item -ItemType Directory -Force $target | Out-Null
             Push-Location $target
-            try { Exec cmake -E tar xf "$WorkRoot/obs-studio/.deps/$filename" } finally { Pop-Location }
-            [IO.File]::WriteAllText("$WorkRoot/obs-studio/.deps/.dependency_$($spec[0])_$arch.sha256", $hash)
+            try { Exec cmake -E tar xf "$WorkRoot/obs-studio/.deps/$($dep.FileName)" } finally { Pop-Location }
+            [IO.File]::WriteAllText("$WorkRoot/obs-studio/.deps/.dependency_$($dep.Kind)_$($dep.Arch).sha256", $dep.Hash)
         }
         $stock = "$WorkRoot/obs-studio/.deps/obs-deps-2026-08-26-x64/bin/ffmpeg.exe"
         foreach ($kind in @('encoders','decoders','filters','formats','protocols','buildconf')) {
@@ -246,8 +237,13 @@ try {
         Exec cmake --build build/vpl --config Release --parallel 6
         Exec cmake --install build/vpl --config Release
     }
+    Stage codec-sources {
+        # Source trees downloaded by Download-Sources.ps1 through the obs-deps
+        # recipes; the codec builds below start at their Patch stage.
+        Expand-Cache 'codec-sources.7z' "$WorkRoot/build"
+    }
     foreach ($codec in @('opus','libogg','libvorbis','libvpx','svt-av1','aom','lame')) {
-        Stage "codec-$codec" { Exec pwsh -NoProfile -File "$WorkRoot/Build-CodecDependencies.ps1" -Dependencies $codec }
+        Stage "codec-$codec" { Exec pwsh -NoProfile -File "$WorkRoot/Build-CodecDependencies.ps1" -SkipSetup -Dependencies $codec }
     }
     Stage obs { Exec pwsh -NoProfile -File "$WorkRoot/Build-OBS.ps1" }
     Stage ffmpeg { Exec pwsh -NoProfile -File "$WorkRoot/Build-FFmpeg.ps1" }
