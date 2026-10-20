@@ -40,16 +40,13 @@ $options += @(
 )
 ```
 # バージョン宣言 (sources.psd1 / sources.lock)
-cargo likeなバージョン指定を実装しています。version upに伴うABIの変更に注意してください。
+モダンなパッケージマネージャーに似たバージョン宣言を実装しています。ABI互換が保たれていることを確認してからversionを変更してください。
 | ファイル | 役割 |
 | --- | --- |
 | `sources.psd1` | `'fdk-aac' = 'v2.0.3'` のようにタグ・ブランチ・コミットを書く |
 | `sources.lock` | 自動生成。コミットidとアーカイブのSHA256を記録 |
 
 ```PowerShell
-# バージョン変更: sources.psd1 の該当行を書き換えるだけ
-#   'fdk-aac' = 'v2.0.3'
-
 # 変更された項目だけ解決・再取得し、sources.lock を更新
 pwsh -executionpolicy bypass .\Download-Sources.ps1
 # 特定の項目だけ更新 (cargo update -p 相当)
