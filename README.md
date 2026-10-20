@@ -40,13 +40,11 @@ $options += @(
 )
 ```
 # バージョン宣言 (sources.psd1 / sources.lock)
-バージョンの指定は Cargo と同じ「宣言ファイル + ロックファイル」方式です。
-
+cargo likeなバージョン指定を実装しています。version upに伴うABIの変更に注意してください。
 | ファイル | 役割 |
 | --- | --- |
-| `sources.psd1` | 人が編集する宣言。`'fdk-aac' = 'v2.0.3'` のようにタグ・ブランチ・コミットを書く |
-| `sources.lock` | 自動生成。解決済みコミットとアーカイブのSHA256を記録(ビルドはこれだけを読む) |
-| `source-cache\` | 実体の7zアーカイブ(バージョン管理対象外) |
+| `sources.psd1` | `'fdk-aac' = 'v2.0.3'` のようにタグ・ブランチ・コミットを書く |
+| `sources.lock` | 自動生成。コミットidとアーカイブのSHA256を記録 |
 
 ```PowerShell
 # バージョン変更: sources.psd1 の該当行を書き換えるだけ
@@ -57,7 +55,6 @@ pwsh -executionpolicy bypass .\Download-Sources.ps1
 # 特定の項目だけ更新 (cargo update -p 相当)
 pwsh -executionpolicy bypass .\Download-Sources.ps1 -Package fdk-aac
 ```
-宣言を書き換えただけではビルド結果は変わりません(lock が契約)。`Download-Sources.ps1` を実行して初めてビルドに反映されます。
 
 # ダウンロードとビルドの分離
 依存関係の取得(オンライン)とビルド(オフライン)は別コマンドに分離されています。
