@@ -9,6 +9,12 @@ source cache (./source-cache by default) that Download-Sources.ps1 filled with
 Everything is generated in ./work next to this script, which is git-ignored;
 re-run the script to resume completed stages. The resulting
 program/configuration is reproduced, not a byte-for-byte reproducible binary.
+
+Stages run concurrently wherever their inputs allow (repro/ParallelTasks.ps1):
+the small libraries (fdk, vpl, the codecs) build alongside each other and OBS
+builds while FFmpeg builds; only real dependencies order them (libvorbis after
+libogg, OBS after fdk/ATL/prebuilt deps, FFmpeg after every library and its
+patches). -ThrottleLimit caps how many stages run at the same time.
 #>
 [CmdletBinding()]
 param(
@@ -17,7 +23,8 @@ param(
     [string]$VSInstallPath,
     [string]$SourceCache,
     [switch]$CheckTools,
-    [switch]$PrepareOnly
+    [switch]$PrepareOnly,
+    [int]$ThrottleLimit
 )
 $ErrorActionPreference = 'Stop'
 function Set-ConsoleEncoding([System.Text.Encoding]$Encoding, [int]$CodePage) {
@@ -59,17 +66,6 @@ function Write-LogLine([string]$Line, [string]$Kind) {
     if (!$Kind) { $Kind = Get-LogKind $Line }
     Write-Host "$($script:LogColors[$Kind])$Line$ansi[0m"
 }
-function Invoke-Logged([scriptblock]$Action, [string]$LogFile) {
-    # One coloured line at a time keeps long builds streaming and leaves the
-    # log file free of ANSI escapes.
-    & $Action *>&1 | ForEach-Object {
-        $text = if ($_ -is [System.Management.Automation.InformationRecord]) { "$($_.MessageData)" } else { "$_" }
-        foreach ($line in ($text -split "`r?`n")) {
-            if ($LogFile) { Add-Content -LiteralPath $LogFile -Value $line }
-            Write-LogLine $line
-        }
-    }
-}
 # The only build output location. Keeping it fixed means the scripts below can
 # never be pointed at a directory that is tracked by git.
 $WorkRoot = Join-Path $PSScriptRoot 'work'
@@ -82,6 +78,7 @@ $PayloadFiles = @(
     'Package-OBS.ps1',
     'repro/BuildEnvironment.ps1',
     'repro/SourceCache.ps1',
+    'repro/ParallelTasks.ps1',
     'repro/UpstreamAdapters.ps1',
     'tools/LocalATL.props',
     'verification/CMakeLists.txt',
@@ -91,6 +88,7 @@ $PayloadFiles = @(
 )
 . (Join-Path $PSScriptRoot 'repro/BuildEnvironment.ps1')
 . (Join-Path $PSScriptRoot 'repro/SourceCache.ps1')
+. (Join-Path $PSScriptRoot 'repro/ParallelTasks.ps1')
 Get-SevenZip | Out-Null
 $tools = Get-BuildEnvironment -MsysRoot $MsysRoot -LLVMRoot $LLVMRoot -VSInstallPath $VSInstallPath
 Write-LogLine 'Required build tools: PASS'
@@ -149,116 +147,181 @@ New-Item -ItemType Directory -Force "$WorkRoot/logs", "$WorkRoot/.stages", "$Wor
 $tools | ConvertTo-Json -Depth 6 | Set-Content "$WorkRoot/verification/build-tools.json"
 $oldLocation = Get-Location
 Set-Location $WorkRoot
-function Exec {
-    $Command = $args[0]
-    $Arguments = @($args | Select-Object -Skip 1)
-    & $Command @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "Command failed ($LASTEXITCODE): $Command $($Arguments -join ' ')" }
-}
-function Stage([string]$Name, [scriptblock]$Action) {
-    Set-Location $WorkRoot
-    $stamp = "$WorkRoot/.stages/$Name.json"
-    if (Test-Path $stamp) {
-        $previous = Get-Content $stamp -Raw | ConvertFrom-Json
-        if ($previous.script_sha256 -eq $scriptHash) { Write-LogLine "[SKIP] $Name (completed)"; return }
-    }
-    Write-LogLine "[BUILD] $Name"
-    $log = "$WorkRoot/logs/$Name.log"
-    [IO.File]::WriteAllText($log, '')
-    Invoke-Logged $Action $log
-    @{script_sha256=$scriptHash;completed_utc=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json | Set-Content $stamp
-}
-function Expand-Cache([string]$Name, [string]$Destination) {
-    Write-LogLine "[CACHE] $Name -> $Destination" Download
-    Expand-SourceArchive "$SourceCache/$Name" $Destination
-}
-function Assert-CachedFile([string]$Path, [string]$Sha256) {
-    # Re-checks the pinned hash of a file restored from the source cache.
-    if (!(Test-Path -LiteralPath $Path)) { throw "Missing file restored from the source cache: $Path" }
-    if ((Get-FileHash -LiteralPath $Path).Hash -ne $Sha256) { throw "SHA256 mismatch: $Path" }
-}
 try {
-    Stage sources {
-        $commits = [ordered]@{}
-        foreach ($repo in Get-LockedRepositories $lock) {
-            Expand-Cache "git-$($repo.Name).7z" $WorkRoot
-            $head = & git -C $repo.Name rev-parse HEAD
-            if ($head -ne $repo.Commit) { throw "Source cache commit mismatch: $($repo.Name) is $head, expected $($repo.Commit)." }
-            if ($repo.CoreAbbrev) { Exec git -C $repo.Name config core.abbrev $repo.CoreAbbrev }
-            $commits[$repo.Name] = $head
-        }
-        # Offline integrity check: every submodule must be checked out at the
-        # commit the pinned obs-studio tree records.
-        $submodules = & git -C obs-studio submodule status --recursive
-        if ($LASTEXITCODE) { throw 'git submodule status failed' }
-        $bad = @($submodules | Where-Object { $_ -match '^[+-U]' })
-        if ($bad.Count) { throw "obs-studio submodules are not fully checked out in the source cache:`n$($bad -join "`n")" }
-        $commits | ConvertTo-Json | Set-Content verification/source-commits.json
+if ($ThrottleLimit -lt 1) { $ThrottleLimit = [Math]::Max(2, [int][Math]::Ceiling([Environment]::ProcessorCount / 2)) }
+# --- Parallel stage graph ---------------------------------------------------
+# Every stage body runs in its own thread job (repro/ParallelTasks.ps1), so
+# independent stages overlap: the small libraries build alongside each other
+# and OBS builds while FFmpeg builds. Only real dependencies order them; each
+# job's output goes to logs/<stage>.log and to the console, prefixed with the
+# stage name. The prelude rebuilds the small helper environment the bodies use.
+$shared = [pscustomobject]@{ WorkRoot = $WorkRoot; SourceCache = $SourceCache; Lock = $lock }
+$taskPrelude = {
+    $ErrorActionPreference = 'Stop'
+    Set-Location $Shared.WorkRoot
+    . "$($Shared.WorkRoot)/repro/SourceCache.ps1"
+    function Expand-Cache([string]$Name, [string]$Destination) {
+        Write-Output "[CACHE] $Name -> $Destination"
+        Expand-SourceArchive "$($Shared.SourceCache)/$Name" $Destination
     }
-    Stage atl {
-        $atl = Get-PinnedAtl
-        Expand-Cache 'atl.7z' "$WorkRoot/downloads"
-        foreach ($part in $atl.Files.Keys) {
-            $file = Get-PinnedAtlFileName $part
-            Assert-CachedFile "$WorkRoot/downloads/$file" $atl.Files[$part]
-            Expand-Archive -LiteralPath "downloads/$file" -DestinationPath tools/atl -Force
-        }
+    function Assert-CachedFile([string]$Path, [string]$Sha256) {
+        # Re-checks the pinned hash of a file restored from the source cache.
+        if (!(Test-Path -LiteralPath $Path)) { throw "Missing file restored from the source cache: $Path" }
+        if ((Get-FileHash -LiteralPath $Path).Hash -ne $Sha256) { throw "SHA256 mismatch: $Path" }
     }
-    Stage official-dependencies {
-        Expand-Cache 'official-dependencies.7z' "$WorkRoot/obs-studio/.deps"
-        foreach ($dep in (Get-OfficialDependencySpecs "$WorkRoot/obs-studio")) {
-            Assert-CachedFile "$WorkRoot/obs-studio/.deps/$($dep.FileName)" $dep.Hash
-            $target = "$WorkRoot/obs-studio/.deps/$($dep.Destination)"
-            New-Item -ItemType Directory -Force $target | Out-Null
-            Push-Location $target
-            try { Exec cmake -E tar xf "$WorkRoot/obs-studio/.deps/$($dep.FileName)" } finally { Pop-Location }
-            [IO.File]::WriteAllText("$WorkRoot/obs-studio/.deps/.dependency_$($dep.Kind)_$($dep.Arch).sha256", $dep.Hash)
-        }
-        $stock = "$WorkRoot/obs-studio/.deps/obs-deps-2026-08-26-x64/bin/ffmpeg.exe"
-        foreach ($kind in @('encoders','decoders','filters','formats','protocols','buildconf')) {
-            & $stock -hide_banner "-$kind" *> "verification/stock-$kind.txt"
-            if ($LASTEXITCODE) { throw "Stock FFmpeg query failed: $kind" }
-        }
+}.ToString()
+$sourcesBody = {
+    $commits = [ordered]@{}
+    foreach ($repo in Get-LockedRepositories $Shared.Lock) {
+        Expand-Cache "git-$($repo.Name).7z" $Shared.WorkRoot
+        $head = & git -C $repo.Name rev-parse HEAD
+        if ($head -ne $repo.Commit) { throw "Source cache commit mismatch: $($repo.Name) is $head, expected $($repo.Commit)." }
+        if ($repo.CoreAbbrev) { Exec git -C $repo.Name config core.abbrev $repo.CoreAbbrev }
+        $commits[$repo.Name] = $head
     }
-    Stage ffmpeg-patches {
-        Get-ChildItem "$WorkRoot/obs-deps/utils.pwsh/*.ps1" | ForEach-Object { . $_.FullName }
-        . "$WorkRoot/obs-deps/deps.ffmpeg/99-ffmpeg.ps1"
-        Push-Location ffmpeg
-        try { foreach ($item in $Patches) { Safe-Patch @item } } finally { Pop-Location }
+    # Offline integrity check: every submodule must be checked out at the
+    # commit the pinned obs-studio tree records.
+    $submodules = & git -C obs-studio submodule status --recursive
+    if ($LASTEXITCODE) { throw 'git submodule status failed' }
+    $bad = @($submodules | Where-Object { $_ -match '^[+-U]' })
+    if ($bad.Count) { throw "obs-studio submodules are not fully checked out in the source cache:`n$($bad -join "`n")" }
+    $commits | ConvertTo-Json | Set-Content verification/source-commits.json
+}
+$atlBody = {
+    $atl = Get-PinnedAtl
+    Expand-Cache 'atl.7z' "$($Shared.WorkRoot)/downloads"
+    foreach ($part in $atl.Files.Keys) {
+        $file = Get-PinnedAtlFileName $part
+        Assert-CachedFile "$($Shared.WorkRoot)/downloads/$file" $atl.Files[$part]
+        Expand-Archive -LiteralPath "downloads/$file" -DestinationPath tools/atl -Force
     }
-    if ($PrepareOnly) { Write-LogLine "Preparation complete: $WorkRoot"; return }
-    Stage fdk {
-        Exec cmake -S fdk-aac -B build/fdk -G 'Visual Studio 18 2026' -A x64 -DBUILD_SHARED_LIBS=OFF "-DCMAKE_INSTALL_PREFIX=$WorkRoot/local"
-        Exec cmake --build build/fdk --config Release --parallel 6
-        Exec cmake --install build/fdk --config Release
+}
+$officialDependenciesBody = {
+    Expand-Cache 'official-dependencies.7z' "$($Shared.WorkRoot)/obs-studio/.deps"
+    foreach ($dep in (Get-OfficialDependencySpecs "$($Shared.WorkRoot)/obs-studio")) {
+        Assert-CachedFile "$($Shared.WorkRoot)/obs-studio/.deps/$($dep.FileName)" $dep.Hash
+        $target = "$($Shared.WorkRoot)/obs-studio/.deps/$($dep.Destination)"
+        New-Item -ItemType Directory -Force $target | Out-Null
+        Push-Location $target
+        try { Exec cmake -E tar xf "$($Shared.WorkRoot)/obs-studio/.deps/$($dep.FileName)" } finally { Pop-Location }
+        [IO.File]::WriteAllText("$($Shared.WorkRoot)/obs-studio/.deps/.dependency_$($dep.Kind)_$($dep.Arch).sha256", $dep.Hash)
     }
-    Stage vpl {
-        Exec cmake -S libvpl -B build/vpl -G 'Visual Studio 18 2026' -A x64 -DBUILD_SHARED_LIBS=OFF -DINSTALL_EXAMPLES=OFF "-DCMAKE_INSTALL_PREFIX=$WorkRoot/local"
-        Exec cmake --build build/vpl --config Release --parallel 6
-        Exec cmake --install build/vpl --config Release
+    $stock = "$($Shared.WorkRoot)/obs-studio/.deps/obs-deps-2026-08-26-x64/bin/ffmpeg.exe"
+    foreach ($kind in @('encoders','decoders','filters','formats','protocols','buildconf')) {
+        & $stock -hide_banner "-$kind" *> "verification/stock-$kind.txt"
+        if ($LASTEXITCODE) { throw "Stock FFmpeg query failed: $kind" }
     }
-    Stage codec-sources {
-        # Source trees downloaded by Download-Sources.ps1 through the obs-deps
-        # recipes; the codec builds below start at their Patch stage.
-        Expand-Cache 'codec-sources.7z' "$WorkRoot/build"
-    }
-    foreach ($codec in @('opus','libogg','libvorbis','libvpx','svt-av1','aom','lame')) {
-        Stage "codec-$codec" { Exec pwsh -NoProfile -File "$WorkRoot/Build-CodecDependencies.ps1" -SkipSetup -Dependencies $codec }
-    }
-    Stage obs { Exec pwsh -NoProfile -File "$WorkRoot/Build-OBS.ps1" }
-    Stage ffmpeg { Exec pwsh -NoProfile -File "$WorkRoot/Build-FFmpeg.ps1" }
-    # Packaging and validation always run; they are intentionally not skipped on resume.
-    Invoke-Logged { Exec pwsh -NoProfile -File "$WorkRoot/Package-OBS.ps1" }
-    Invoke-Logged { Exec cmake -S verification -B build/verification -G 'Visual Studio 18 2026' -A x64 }
-    Invoke-Logged { Exec cmake --build build/verification --config Release --parallel 4 }
-    Invoke-Logged { Exec pwsh -NoProfile -File "$WorkRoot/verification/Verify-Package.ps1" }
-    $package = "$WorkRoot/OBS-Studio-FDK-QSV"
+}
+$ffmpegPatchesBody = {
+    Get-ChildItem "$($Shared.WorkRoot)/obs-deps/utils.pwsh/*.ps1" | ForEach-Object { . $_.FullName }
+    . "$($Shared.WorkRoot)/obs-deps/deps.ffmpeg/99-ffmpeg.ps1"
+    Push-Location ffmpeg
+    try { foreach ($item in $Patches) { Safe-Patch @item } } finally { Pop-Location }
+}
+$fdkBody = {
+    Exec cmake -S fdk-aac -B build/fdk -G 'Visual Studio 18 2026' -A x64 -DBUILD_SHARED_LIBS=OFF "-DCMAKE_INSTALL_PREFIX=$($Shared.WorkRoot)/local"
+    Exec cmake --build build/fdk --config Release --parallel 6
+    Exec cmake --install build/fdk --config Release
+}
+$vplBody = {
+    Exec cmake -S libvpl -B build/vpl -G 'Visual Studio 18 2026' -A x64 -DBUILD_SHARED_LIBS=OFF -DINSTALL_EXAMPLES=OFF "-DCMAKE_INSTALL_PREFIX=$($Shared.WorkRoot)/local"
+    Exec cmake --build build/vpl --config Release --parallel 6
+    Exec cmake --install build/vpl --config Release
+}
+$codecSourcesBody = {
+    # Source trees downloaded by Download-Sources.ps1 through the obs-deps
+    # recipes; the codec builds below start at their Patch stage.
+    Expand-Cache 'codec-sources.7z' "$($Shared.WorkRoot)/build"
+}
+$codecBody = {
+    param($Codec)
+    Exec pwsh -NoProfile -File "$($Shared.WorkRoot)/Build-CodecDependencies.ps1" -SkipSetup -Dependencies $Codec
+}
+$obsBody = { Exec pwsh -NoProfile -File "$($Shared.WorkRoot)/Build-OBS.ps1" }
+$ffmpegBody = { Exec pwsh -NoProfile -File "$($Shared.WorkRoot)/Build-FFmpeg.ps1" }
+# Packaging and validation always run; they are intentionally not skipped on
+# resume, so this stage is in $alwaysRun below.
+$finalizeBody = {
+    Exec pwsh -NoProfile -File "$($Shared.WorkRoot)/Package-OBS.ps1"
+    Exec cmake -S verification -B build/verification -G 'Visual Studio 18 2026' -A x64
+    Exec cmake --build build/verification --config Release --parallel 4
+    Exec pwsh -NoProfile -File "$($Shared.WorkRoot)/verification/Verify-Package.ps1"
+    $package = "$($Shared.WorkRoot)/OBS-Studio-FDK-QSV"
     if (!(Test-Path "$package/portable_mode") -or (Get-Item "$package/portable_mode").Length -ne 0) { throw 'Portable marker validation failed.' }
     New-Item -ItemType Directory -Force "$package/build-info", "$package/licenses/fdk-aac" | Out-Null
     Copy-Item verification/source-commits.json,verification/build-tools.json,verification/encoders-diff.json,verification/decoders-diff.json "$package/build-info" -Force
     Copy-Item fdk-aac/NOTICE "$package/licenses/fdk-aac/NOTICE" -Force
-    Write-LogLine "SUCCESS: $package/Start-OBS.cmd"
-    Write-LogLine 'QSV/NVENC/AMF encoders are registered. Actual encoding requires a compatible GPU and driver; no hardware success is inferred.' Warning
+}
+$graph = [ordered]@{
+    sources = @{ Depends = @(); Body = $sourcesBody; Args = @() }
+    atl = @{ Depends = @('sources'); Body = $atlBody; Args = @() }
+    'official-dependencies' = @{ Depends = @('sources'); Body = $officialDependenciesBody; Args = @() }
+    'ffmpeg-patches' = @{ Depends = @('sources'); Body = $ffmpegPatchesBody; Args = @() }
+    fdk = @{ Depends = @('sources'); Body = $fdkBody; Args = @() }
+    vpl = @{ Depends = @('sources'); Body = $vplBody; Args = @() }
+    'codec-sources' = @{ Depends = @('sources'); Body = $codecSourcesBody; Args = @() }
+}
+foreach ($codec in @('opus', 'libogg', 'libvorbis', 'libvpx', 'svt-av1', 'aom', 'lame')) {
+    # libvorbis links against the ogg that codec-libogg installs into local/.
+    $depends = @('codec-sources') + @(if ($codec -eq 'libvorbis') { 'codec-libogg' })
+    $graph["codec-$codec"] = @{ Depends = $depends; Body = $codecBody; Args = @($codec) }
+}
+$graph['obs'] = @{ Depends = @('atl', 'official-dependencies', 'fdk'); Body = $obsBody; Args = @() }
+$graph['ffmpeg'] = @{
+    Depends = @('official-dependencies', 'ffmpeg-patches', 'fdk', 'vpl') + @(foreach ($codec in @('opus', 'libogg', 'libvorbis', 'libvpx', 'svt-av1', 'aom', 'lame')) { "codec-$codec" })
+    Body = $ffmpegBody
+    Args = @()
+}
+$graph['finalize'] = @{ Depends = @('obs', 'ffmpeg'); Body = $finalizeBody; Args = @() }
+$alwaysRun = @('finalize')
+if ($PrepareOnly) {
+    foreach ($name in @('fdk', 'vpl', 'codec-sources', 'obs', 'ffmpeg', 'finalize') + @(foreach ($codec in @('opus', 'libogg', 'libvorbis', 'libvpx', 'svt-av1', 'aom', 'lame')) { "codec-$codec" })) {
+        $graph.Remove($name)
+    }
+}
+# Completed stages stay completed: drop them (and the edges into them) when
+# their stamp matches the current script hash.
+$skipped = @{}
+foreach ($name in @($graph.Keys)) {
+    $stamp = "$WorkRoot/.stages/$name.json"
+    if ($name -notin $alwaysRun -and (Test-Path $stamp) -and ((Get-Content $stamp -Raw | ConvertFrom-Json).script_sha256 -eq $scriptHash)) {
+        Write-LogLine "[SKIP] $name (completed)"
+        $skipped[$name] = $true
+        $graph.Remove($name)
+    }
+}
+foreach ($task in $graph.Values) {
+    $task.Depends = @($task.Depends | Where-Object { $_ -notin $skipped.Keys })
+}
+$onLine = {
+    param($task, $line)
+    Add-Content -LiteralPath "$WorkRoot/logs/$task.log" -Value $line
+    Write-LogLine "[$task] $line"
+}
+$onTaskEvent = {
+    param($task, $event, $detail)
+    if ($event -eq 'start') {
+        [IO.File]::WriteAllText("$WorkRoot/logs/$task.log", '')
+        Write-LogLine "[BUILD] $task"
+    } elseif ($event -eq 'completed') {
+        if ($task -notin $alwaysRun) {
+            @{script_sha256=$scriptHash;completed_utc=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json | Set-Content "$WorkRoot/.stages/$task.json"
+        }
+        Write-LogLine "[ OK ] $task ($([int][Math]::Ceiling($detail.TotalSeconds))s)"
+    } else {
+        Write-LogLine "[FAIL] $task : $detail" Error
+    }
+}
+$run = $null
+if ($graph.Count) {
+    $run = Invoke-TaskGraph -Tasks $graph -Prelude $taskPrelude -Shared $shared -ThrottleLimit $ThrottleLimit `
+        -OnLine $onLine -OnTaskEvent $onTaskEvent
+}
+if ($PrepareOnly) { Write-LogLine "Preparation complete: $WorkRoot"; return }
+$package = "$WorkRoot/OBS-Studio-FDK-QSV"
+Write-LogLine "SUCCESS: $package/Start-OBS.cmd"
+Write-LogLine 'QSV/NVENC/AMF encoders are registered. Actual encoding requires a compatible GPU and driver; no hardware success is inferred.' Warning
+if ($run) { Write-LogLine "Stages ran in $([int]$run.Elapsed.TotalSeconds)s (throttle $ThrottleLimit)" }
 } finally {
     Set-Location $oldLocation
     Set-ConsoleEncoding $originalConsoleEncoding $originalCodePage

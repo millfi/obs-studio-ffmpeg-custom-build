@@ -80,6 +80,9 @@ pwsh -executionpolicy bypass .\Download-Sources.ps1
 | `-Locked` | lock が古ければエラーにし、取得もlock更新もしない |
 | `-Force` | lock が最新でも全アーカイブを作り直す |
 | `-SourceCache <path>` | 格納先の変更(既定: `.\source-cache`) |
+| `-ThrottleLimit <n>` | 同時に実行する取得・圧縮タスク数の上限(既定: コア数の半分) |
+
+取得処理は並列に走ります。git チェックアウトと圧縮は全リポジトリ同時、固定 URL の取得は参照するソースツリーの圧縮完了後に開始されます(official-dependencies は obs-studio の後、codec-sources は obs-deps の後)。
 
 アーカイブの合計サイズは約750MBです。
 
@@ -89,6 +92,8 @@ pwsh -executionpolicy bypass .\Download-Sources.ps1
 pwsh -executionpolicy bypass .\Build-Reproduce.ps1
 ```
 7z(Zstandard対応、例: 7-Zip ZS)が必要です。その他必要なツールは従来通りです。`sources.lock` のハッシュが変わると全ステージが再実行されます。
+
+ビルドも並列に走ります。独立したステージは同時実行され(fdk / vpl / 各 codec は互いに並列、OBS と FFmpeg も並列)、依存関係のあるステージだけが直列化されます(libvorbis は libogg の後、OBS は fdk/ATL/公式依存の後、FFmpeg は全ライブラリとパッチ適用の後、パッケージは OBS と FFmpeg の後)。同時実行ステージ数は `-ThrottleLimit <n>`(既定: コア数の半分)で調整でき、各ステージの出力は `work\logs\<ステージ名>.log` に残ります。
 # OBS Binary Location
 ```
 

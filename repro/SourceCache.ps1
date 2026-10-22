@@ -249,3 +249,75 @@ function Expand-SourceArchive {
     & $sevenZip x -aoa -bso0 -bsp0 "-o$Destination" $Archive
     if ($LASTEXITCODE) { throw "7z x failed ($LASTEXITCODE): $Archive" }
 }
+
+# ---------------------------------------------------------------------------
+# Task helpers (shared by the download and the build pipeline)
+#
+# These live here because both scripts run their work units through
+# repro/ParallelTasks.ps1, whose task jobs rebuild their small helper
+# environment by dot-sourcing this file.
+# ---------------------------------------------------------------------------
+
+function Exec {
+    $command = $args[0]
+    $arguments = @($args | Select-Object -Skip 1)
+    & $command @arguments
+    if ($LASTEXITCODE) { throw "Command failed ($LASTEXITCODE): $command $($arguments -join ' ')" }
+}
+
+function Get-DownloadedFile([string]$Url, [string]$Path, [string]$Sha256) {
+    if (!(Test-Path -LiteralPath $Path)) {
+        Write-Host "[DOWNLOAD] $Url"
+        Invoke-WebRequest -Uri $Url -OutFile "$Path.partial" -MaximumRetryCount 3
+        if ((Get-FileHash "$Path.partial").Hash -ne $Sha256) { throw "SHA256 mismatch: $Url" }
+        Move-Item -LiteralPath "$Path.partial" -Destination $Path
+    }
+    if ((Get-FileHash $Path).Hash -ne $Sha256) { throw "Cached SHA256 mismatch: $Path" }
+}
+
+function Get-SourceCheckout($Decl, [string]$Commit, [string]$Path) {
+    # Shallow checkout of the resolved commit, plus the optional extra history
+    # and tag refs that make "git describe" report the same version string as
+    # the original build.
+    if (!(Test-Path "$Path/.git")) { Exec git init $Path }
+    if ('origin' -notin @(& git -C $Path remote)) { Exec git -C $Path remote add origin $Decl.Url }
+    $head = & git -C $Path rev-parse --verify HEAD 2>$null
+    if ($head -and $head -ne $Commit) { throw "Refusing to overwrite existing $($Decl.Name) commit $head (expected $Commit)." }
+    if ($head -ne $Commit) {
+        Exec git -C $Path fetch --depth 1 origin $Commit
+        Exec git -C $Path checkout --detach $Commit
+        if ($Decl.History) { Exec git -C $Path fetch --deepen $Decl.History origin $Commit }
+        if ($Decl.Submodules) { Exec git -C $Path submodule update --init --recursive }
+    }
+    # The tag must land in refs/tags/<tag>: fetching "refs/tags/<tag>" without a
+    # destination refspec only records it in FETCH_HEAD, so "git describe" (the
+    # OBS/FFmpeg version string) cannot see it. Run outside the commit guard so
+    # a resumed staging checkout still gains its tags; "+" keeps it idempotent.
+    foreach ($tag in $Decl.Tags) {
+        Exec git -C $Path fetch --depth 1 origin "+refs/tags/${tag}:refs/tags/${tag}"
+        $tagRef = & git -C $Path rev-parse --verify -q "refs/tags/${tag}^{}" 2>$null
+        if (!$tagRef) { throw "Tag '$tag' was not stored in $($Decl.Name); 'git describe' would not see it." }
+    }
+    if ($Decl.CoreAbbrev) { Exec git -C $Path config core.abbrev $Decl.CoreAbbrev }
+    if ((& git -C $Path rev-parse HEAD) -ne $Commit) { throw "Commit verification failed: $($Decl.Name)" }
+}
+
+function Test-CachedEntry {
+    # The archive is present and the lock records it with the same pin, so the
+    # entry can be carried forward without touching the network. The lock entry
+    # parameter must not be called $Locked: that would collide with the script's
+    # -Locked switch in the same scope and hit its switch type.
+    param([string]$Archive, $LockedEntry, [string]$Pin, [string]$PinField)
+    if (!$LockedEntry) { return $false }
+    if ([string]$LockedEntry.$PinField -ne $Pin) { return $false }
+    if (!(Test-Path -LiteralPath $Archive)) { return $false }
+    return ((Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash -eq $LockedEntry.sha256)
+}
+
+function Get-StagingCheckout {
+    # A checkout from the cache instead of the network, for the steps that read
+    # pinned metadata out of a source tree.
+    param([string]$SourceCache, [string]$Repos, [string]$Name)
+    if (!(Test-Path "$Repos/$Name/.git")) { Expand-SourceArchive "$SourceCache/git-$Name.7z" $Repos }
+    return "$Repos/$Name"
+}

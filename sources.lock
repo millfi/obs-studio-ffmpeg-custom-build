@@ -1,16 +1,16 @@
 {
   "kind": "obs-fdk-qsv-sources-lock-v1",
-  "generated_utc": "2026-10-20T02:58:16.2949533Z",
+  "generated_utc": "2026-10-21T16:54:03.1721269Z",
   "sources": [
     {
       "name": "fdk-aac",
       "url": "https://github.com/mstorsjo/fdk-aac.git",
-      "rev": "7c83d08002332b2730c845eec3497e6bf585dd28",
-      "commit": "7c83d08002332b2730c845eec3497e6bf585dd28",
+      "rev": "c41c3c7516ea8d0d78a53b96b30bed3a29745cc6",
+      "commit": "c41c3c7516ea8d0d78a53b96b30bed3a29745cc6",
       "submodules": false,
       "core_abbrev": 0,
       "archive": "git-fdk-aac.7z",
-      "sha256": "7099E3E03D22C8338C9D62D129B1C1C5FCA11DAE9EF8A793101E193290322966"
+      "sha256": "AFEC5A029499D61DFEB3947B1520471B142878522706B2084C6154206EE17BFF"
     },
     {
       "name": "ffmpeg",
@@ -20,7 +20,7 @@
       "submodules": false,
       "core_abbrev": 0,
       "archive": "git-ffmpeg.7z",
-      "sha256": "488F4C8EE91855E097A69B75C9CC11F9BFB6957042BC094F4D6AA0C6202AD9AE"
+      "sha256": "3E55250B313AB952BD47B015205CEB19CB82E599D4380C4DE2E322DD6F4D0F9D"
     },
     {
       "name": "libvpl",
@@ -30,7 +30,7 @@
       "submodules": false,
       "core_abbrev": 0,
       "archive": "git-libvpl.7z",
-      "sha256": "2B770ABB67BFCB0E0DB589C78223C7D2360B88001AFBBD3D27CB7970DCE970DB"
+      "sha256": "2B23F580F5179F9DD9B08F9CBB22FCA8DA1760518C2E816931D05267E6937A32"
     },
     {
       "name": "obs-deps",
@@ -40,7 +40,7 @@
       "submodules": false,
       "core_abbrev": 0,
       "archive": "git-obs-deps.7z",
-      "sha256": "2DEDA64754EBFFC3CC31748ECA4F9F19208528855ADAD2313B1A610EB7F13453"
+      "sha256": "DFDADF4F91062A36B3E5E975736FC217ECF2A43CD297E4B14B0C1F09BA563924"
     },
     {
       "name": "obs-studio",
@@ -50,7 +50,7 @@
       "submodules": true,
       "core_abbrev": 9,
       "archive": "git-obs-studio.7z",
-      "sha256": "092A561A4CE8860CB26D6FE4E60FC3094FF3D3852FFA151C3A9B1FE280E4E202"
+      "sha256": "C645C5851C5B09A3CA5D5A90E09389B8B0A11CE6288F861A1C542B262490B336"
     }
   ],
   "downloads": [
@@ -58,19 +58,19 @@
       "name": "atl",
       "archive": "atl.7z",
       "pin": "d3f134558bcea78ff632a7db8d5631bc239d285e2f7df75cfcdb2359c6174c10",
-      "sha256": "770C80551434C4E49C09139A5DE1723915282057901CD3A555FC910239DE8249"
+      "sha256": "A1D6AEE6731B5701D04DFD735FE4425AB28596F80585DC437BDC3CCEC1C1C7D6"
     },
     {
       "name": "official-dependencies",
       "archive": "official-dependencies.7z",
       "pin": "b5bfb79093e26ce4b0e71d999f59b6b22f961121",
-      "sha256": "DF37679851222A78A459FDEB714BB705F70FADAF5224F9D34778F8650A3CF02C"
+      "sha256": "FADE766EFE547A29DB259435B6A742D002E9F89EE355E8F6CEB4DCA3FCBB5E98"
     },
     {
       "name": "codec-sources",
       "archive": "codec-sources.7z",
       "pin": "f80e1d30181b0ff2b048b6d8fe8b8c501f3d221c",
-      "sha256": "79B422CCBCA2904C6DACDC21A468DE2C988080EE5A63917299DEB4322782A3C1"
+      "sha256": "A73E9F563295AF30AE07A0A1ADF9FC3AB8A88359301F9A5A835133459E41335D"
     }
   ]
 }

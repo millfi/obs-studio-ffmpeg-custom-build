@@ -34,7 +34,7 @@
             tags = @('32.2.1')
             core_abbrev = 9
         }
-        'fdk-aac' = '7c83d08002332b2730c845eec3497e6bf585dd28'
+        'fdk-aac' = 'c41c3c7516ea8d0d78a53b96b30bed3a29745cc6'
         'ffmpeg' = @{
             rev = '38b88335f99e76ed89ff3c93f877fdefce736c13'
             tags = @('n8.1.2')

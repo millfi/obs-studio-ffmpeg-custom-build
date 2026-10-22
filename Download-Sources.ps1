@@ -16,6 +16,11 @@ lock) are re-resolved and re-downloaded, so bumping one version touches one
 archive. Copy the source-cache directory next to Build-Reproduce.ps1 (or pass
 -SourceCache to the build); the build then runs without any network access.
 
+The eight work units run concurrently wherever their inputs allow: every git
+checkout/pack at once, the fixed downloads as soon as the source tree they read
+is packed (official-dependencies follows obs-studio, codec-sources follows
+obs-deps). -ThrottleLimit caps how many run at the same time.
+
 Needs git and a Zstandard-capable 7z on PATH. Downloaded files and git commits
 are verified against the pinned hashes/commits.
 .PARAMETER Package
@@ -30,6 +35,9 @@ Fail instead of changing anything when sources.lock is out of date
 Re-download and re-pack every archive, even when the lock is current.
 .PARAMETER KeepStaging
 Keep source-cache/.staging (git checkouts and downloaded files) for inspection.
+.PARAMETER ThrottleLimit
+How many download/pack tasks may run at the same time (default: half the
+processor count, at least 2).
 #>
 [CmdletBinding()]
 param(
@@ -38,7 +46,8 @@ param(
     [switch]$Update,
     [switch]$Locked,
     [switch]$Force,
-    [switch]$KeepStaging
+    [switch]$KeepStaging,
+    [int]$ThrottleLimit
 )
 $ErrorActionPreference = 'Stop'
 # git/7z report in UTF-8; decode it as such instead of with the Japanese
@@ -46,51 +55,18 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new() } catch { }
 $root = $PSScriptRoot
 . "$root/repro/SourceCache.ps1"
+. "$root/repro/ParallelTasks.ps1"
 if (!$SourceCache) { $SourceCache = "$root/source-cache" }
 $SourceCache = [IO.Path]::GetFullPath($SourceCache)
 Get-SevenZip | Out-Null
 if (!(Get-Command git.exe -ErrorAction SilentlyContinue)) { throw 'git.exe must be on PATH.' }
-
-function Exec {
-    $command = $args[0]
-    $arguments = @($args | Select-Object -Skip 1)
-    & $command @arguments
-    if ($LASTEXITCODE) { throw "Command failed ($LASTEXITCODE): $command $($arguments -join ' ')" }
-}
-
-function Get-DownloadedFile([string]$Url, [string]$Path, [string]$Sha256) {
-    if (!(Test-Path -LiteralPath $Path)) {
-        Write-Host "[DOWNLOAD] $Url"
-        Invoke-WebRequest -Uri $Url -OutFile "$Path.partial" -MaximumRetryCount 3
-        if ((Get-FileHash "$Path.partial").Hash -ne $Sha256) { throw "SHA256 mismatch: $Url" }
-        Move-Item -LiteralPath "$Path.partial" -Destination $Path
-    }
-    if ((Get-FileHash $Path).Hash -ne $Sha256) { throw "Cached SHA256 mismatch: $Path" }
-}
-
-function Get-SourceCheckout($Decl, [string]$Commit, [string]$Path) {
-    # Shallow checkout of the resolved commit, plus the optional extra history
-    # and tag refs that make "git describe" report the same version string as
-    # the original build.
-    if (!(Test-Path "$Path/.git")) { Exec git init $Path }
-    if ('origin' -notin @(& git -C $Path remote)) { Exec git -C $Path remote add origin $Decl.Url }
-    $head = & git -C $Path rev-parse --verify HEAD 2>$null
-    if ($head -and $head -ne $Commit) { throw "Refusing to overwrite existing $($Decl.Name) commit $head (expected $Commit)." }
-    if ($head -ne $Commit) {
-        Exec git -C $Path fetch --depth 1 origin $Commit
-        Exec git -C $Path checkout --detach $Commit
-        if ($Decl.History) { Exec git -C $Path fetch --deepen $Decl.History origin $Commit }
-        foreach ($tag in $Decl.Tags) { Exec git -C $Path fetch --depth 1 origin "refs/tags/$tag" }
-        if ($Decl.Submodules) { Exec git -C $Path submodule update --init --recursive }
-    }
-    if ($Decl.CoreAbbrev) { Exec git -C $Path config core.abbrev $Decl.CoreAbbrev }
-    if ((& git -C $Path rev-parse HEAD) -ne $Commit) { throw "Commit verification failed: $($Decl.Name)" }
-}
+if ($ThrottleLimit -lt 1) { $ThrottleLimit = [Math]::Max(2, [int][Math]::Ceiling([Environment]::ProcessorCount / 2)) }
 
 $staging = "$SourceCache/.staging"
 $repos = "$staging/repos"
 $files = "$staging/files"
-New-Item -ItemType Directory -Force $SourceCache, $repos, $files | Out-Null
+$resultsDir = "$staging/results"
+New-Item -ItemType Directory -Force $SourceCache, $repos, $files, $resultsDir | Out-Null
 
 $lock = Read-SourceLock $root
 $declarations = @(Get-DeclaredRepositories $root)
@@ -107,156 +83,230 @@ function Test-PackageForced([string]$Name) { $Force -or $Update -or ($selectedPa
 # ref to re-resolve, their pin already follows the pinned source trees.
 function Test-DownloadForced([string]$Name) { $Force -or ($selectedPackages.Count -gt 0 -and ($Name -in $selectedPackages)) }
 
-function Test-CachedEntry {
-    # The archive is present and the lock records it with the same pin, so the
-    # entry can be carried forward without touching the network. The lock entry
-    # parameter must not be called $Locked: that would collide with the script's
-    # -Locked switch in the same scope and hit its switch type.
-    param([string]$Archive, $LockedEntry, [string]$Pin, [string]$PinField)
-    if (!$LockedEntry) { return $false }
-    if ([string]$LockedEntry.$PinField -ne $Pin) { return $false }
-    if (!(Test-Path -LiteralPath $Archive)) { return $false }
-    return ((Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash -eq $LockedEntry.sha256)
+# --- Parallel task graph ----------------------------------------------------
+# Each work unit runs in its own thread job (repro/ParallelTasks.ps1) with the
+# context object below and its own arguments; it writes the sources.lock entry
+# it produced to its result file, so the parent only assembles the lock at the
+# end. The prelude restores the small helper environment every body needs.
+$shared = [pscustomobject]@{
+    Root = $root; SourceCache = $SourceCache; Staging = $staging
+    Repos = $repos; Files = $files
 }
+$taskPrelude = {
+    $ErrorActionPreference = 'Stop'
+    . "$($Shared.Root)/repro/SourceCache.ps1"
+}.ToString()
 
-# --- Declared git sources --------------------------------------------------
-$sourceEntries = [Collections.Generic.List[object]]::new()
-foreach ($decl in $declarations) {
-    $archive = "$SourceCache/git-$($decl.Name).7z"
-    $lockedEntry = Get-LockedSource $lock $decl.Name
-    if (!(Test-PackageSelected $decl.Name) -and $lockedEntry) {
-        $sourceEntries.Add($lockedEntry)
-        continue
-    }
-    if (!(Test-PackageForced $decl.Name) -and (Test-CachedEntry -Archive $archive -LockedEntry $lockedEntry -Pin $decl.Rev -PinField 'rev')) {
-        Write-Host "[SKIP] $(Split-Path $archive -Leaf) (sources.lock is current)"
-        $sourceEntries.Add($lockedEntry)
-        continue
-    }
-    if ($Locked) {
-        throw "sources.lock is out of date for '$($decl.Name)' ($($decl.Rev)). Run Download-Sources.ps1 without -Locked, then rebuild."
-    }
-    Write-Host "[SOURCE] $($decl.Name) rev=$($decl.Rev)"
-    $commit = Resolve-GitCommit $decl.Url $decl.Rev
-    $reuseArchive = $lockedEntry -and ($lockedEntry.commit -eq $commit) -and (Test-Path -LiteralPath $archive) -and
-                    ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -eq $lockedEntry.sha256) -and !$Force
-    if ($reuseArchive) {
-        Write-Host "[REUSE] $($decl.Name) $commit (already packed; only the declaration text changed)"
+# --- Declared git sources ---------------------------------------------------
+$gitTaskBody = {
+    param($Decl, $LockedEntry, $Archive, $Flags, $ResultFile)
+    $entry = $null
+    if (!$Flags.Selected -and $LockedEntry) {
+        $entry = $LockedEntry
+    } elseif (!$Flags.Forced -and (Test-CachedEntry -Archive $Archive -LockedEntry $LockedEntry -Pin $Decl.Rev -PinField 'rev')) {
+        Write-Output "[SKIP] $(Split-Path $Archive -Leaf) (sources.lock is current)"
+        $entry = $LockedEntry
     } else {
-        Get-SourceCheckout $decl $commit "$repos/$($decl.Name)"
-        Compress-SourceArchive $archive $repos @($decl.Name)
+        if ($Flags.Locked) {
+            throw "sources.lock is out of date for '$($Decl.Name)' ($($Decl.Rev)). Run Download-Sources.ps1 without -Locked, then rebuild."
+        }
+        Write-Output "[SOURCE] $($Decl.Name) rev=$($Decl.Rev)"
+        $commit = Resolve-GitCommit $Decl.Url $Decl.Rev
+        $reuseArchive = $LockedEntry -and ($LockedEntry.commit -eq $commit) -and (Test-Path -LiteralPath $Archive) -and
+                        ((Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash -eq $LockedEntry.sha256) -and !$Flags.Force
+        if ($reuseArchive) {
+            Write-Output "[REUSE] $($Decl.Name) $commit (already packed; only the declaration text changed)"
+        } else {
+            Get-SourceCheckout $Decl $commit "$($Shared.Repos)/$($Decl.Name)"
+            Compress-SourceArchive $Archive $Shared.Repos @($Decl.Name)
+        }
+        $entry = [pscustomobject]@{
+            name = $Decl.Name
+            url = $Decl.Url
+            rev = $Decl.Rev
+            commit = $commit
+            submodules = [bool]$Decl.Submodules
+            core_abbrev = [int]$Decl.CoreAbbrev
+            archive = "git-$($Decl.Name).7z"
+            sha256 = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
+        }
     }
-    $sourceEntries.Add([pscustomobject]@{
-        name = $decl.Name
-        url = $decl.Url
-        rev = $decl.Rev
-        commit = $commit
-        submodules = [bool]$decl.Submodules
-        core_abbrev = [int]$decl.CoreAbbrev
-        archive = "git-$($decl.Name).7z"
-        sha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
-    })
+    $entry | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ResultFile
 }
 
-function Get-EntryCommit([string]$Name) {
-    $entry = @($sourceEntries | Where-Object { $_.name -eq $Name })[0]
-    if (!$entry) { throw "sources.lock has no git entry for '$Name'; add it to sources.psd1 and re-run Download-Sources.ps1." }
-    return [string]$entry.commit
-}
-
-# A checkout from the cache instead of the network, for the steps below that
-# read pinned metadata out of a source tree.
-function Get-StagingCheckout([string]$Name) {
-    if (!(Test-Path "$repos/$Name/.git")) { Expand-SourceArchive "$SourceCache/git-$Name.7z" $repos }
-    return "$repos/$Name"
-}
-
-$downloadEntries = [Collections.Generic.List[object]]::new()
-
-# --- ATL VSIX development files (pin = the pinned hash table) --------------
-$atl = Get-PinnedAtl
-$atlArchive = "$SourceCache/atl.7z"
-$atlLocked = Get-LockedDownload $lock 'atl'
-$atlPin = Get-PinHash ([ordered]@{ base = $atl.Base; files = $atl.Files })
-if (!(Test-PackageSelected 'atl') -and $atlLocked) {
-    $downloadEntries.Add($atlLocked)
-} elseif (!(Test-DownloadForced 'atl') -and (Test-CachedEntry -Archive $atlArchive -LockedEntry $atlLocked -Pin $atlPin -PinField 'pin')) {
-    Write-Host '[SKIP] atl.7z (sources.lock is current)'
-    $downloadEntries.Add($atlLocked)
-} else {
-    if ($Locked) { throw "sources.lock is out of date for 'atl'. Run Download-Sources.ps1 without -Locked, then rebuild." }
-    $atlDir = "$files/atl"
-    New-Item -ItemType Directory -Force $atlDir | Out-Null
-    $atlNames = foreach ($part in $atl.Files.Keys) {
-        $file = Get-PinnedAtlFileName $part
-        Get-DownloadedFile "$($atl.Base)/$($atl.Files[$part])/$file" "$atlDir/$file" $atl.Files[$part]
-        $file
+# --- ATL VSIX development files (pin = the pinned hash table) ---------------
+$atlTaskBody = {
+    param($Atl, $LockedEntry, $Archive, $Pin, $Flags, $ResultFile)
+    $entry = $null
+    if (!$Flags.Selected -and $LockedEntry) {
+        $entry = $LockedEntry
+    } elseif (!$Flags.Forced -and (Test-CachedEntry -Archive $Archive -LockedEntry $LockedEntry -Pin $Pin -PinField 'pin')) {
+        Write-Output '[SKIP] atl.7z (sources.lock is current)'
+        $entry = $LockedEntry
+    } else {
+        if ($Flags.Locked) { throw "sources.lock is out of date for 'atl'. Run Download-Sources.ps1 without -Locked, then rebuild." }
+        $atlDir = "$($Shared.Files)/atl"
+        New-Item -ItemType Directory -Force $atlDir | Out-Null
+        $atlNames = foreach ($part in $Atl.Files.Keys) {
+            $file = Get-PinnedAtlFileName $part
+            Get-DownloadedFile "$($Atl.Base)/$($Atl.Files[$part])/$file" "$atlDir/$file" $Atl.Files[$part]
+            $file
+        }
+        Compress-SourceArchive $Archive $atlDir @($atlNames)
+        $entry = [pscustomobject]@{
+            name = 'atl'; archive = 'atl.7z'; pin = $Pin
+            sha256 = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
+        }
     }
-    Compress-SourceArchive $atlArchive $atlDir @($atlNames)
-    $downloadEntries.Add([pscustomobject]@{
-        name = 'atl'; archive = 'atl.7z'; pin = $atlPin
-        sha256 = (Get-FileHash -LiteralPath $atlArchive -Algorithm SHA256).Hash
-    })
+    $entry | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ResultFile
 }
 
-# --- Official prebuilt OBS dependencies (pin = the pinned obs-studio) ------
-$obsStudioCommit = Get-EntryCommit 'obs-studio'
-$depsArchive = "$SourceCache/official-dependencies.7z"
-$depsLocked = Get-LockedDownload $lock 'official-dependencies'
-if (!(Test-PackageSelected 'official-dependencies') -and $depsLocked) {
-    $downloadEntries.Add($depsLocked)
-} elseif (!(Test-DownloadForced 'official-dependencies') -and
-          (Test-CachedEntry -Archive $depsArchive -LockedEntry $depsLocked -Pin $obsStudioCommit -PinField 'pin')) {
-    Write-Host '[SKIP] official-dependencies.7z (sources.lock is current)'
-    $downloadEntries.Add($depsLocked)
-} else {
-    if ($Locked) { throw "sources.lock is out of date for 'official-dependencies'. Run Download-Sources.ps1 without -Locked, then rebuild." }
-    $depsDir = "$files/official-dependencies"
-    New-Item -ItemType Directory -Force $depsDir | Out-Null
-    $specs = Get-OfficialDependencySpecs (Get-StagingCheckout 'obs-studio')
-    foreach ($spec in $specs) { Get-DownloadedFile $spec.Url "$depsDir/$($spec.FileName)" $spec.Hash }
-    Compress-SourceArchive $depsArchive $depsDir @($specs.FileName)
-    $downloadEntries.Add([pscustomobject]@{
-        name = 'official-dependencies'; archive = 'official-dependencies.7z'; pin = $obsStudioCommit
-        sha256 = (Get-FileHash -LiteralPath $depsArchive -Algorithm SHA256).Hash
-    })
+# --- Official prebuilt OBS dependencies (pin = the pinned obs-studio) -------
+# The pin is the commit of the git-obs-studio task, read from its result file,
+# so this task only becomes runnable once obs-studio is packed (Depends below).
+$depsTaskBody = {
+    param($LockedEntry, $Archive, $Flags, $DepResultFile, $ResultFile)
+    $obsStudioCommit = [string](Get-Content -LiteralPath $DepResultFile -Raw | ConvertFrom-Json).commit
+    if (!$obsStudioCommit) { throw "sources.lock has no git entry for 'obs-studio'; add it to sources.psd1 and re-run Download-Sources.ps1." }
+    $entry = $null
+    if (!$Flags.Selected -and $LockedEntry) {
+        $entry = $LockedEntry
+    } elseif (!$Flags.Forced -and (Test-CachedEntry -Archive $Archive -LockedEntry $LockedEntry -Pin $obsStudioCommit -PinField 'pin')) {
+        Write-Output '[SKIP] official-dependencies.7z (sources.lock is current)'
+        $entry = $LockedEntry
+    } else {
+        if ($Flags.Locked) { throw "sources.lock is out of date for 'official-dependencies'. Run Download-Sources.ps1 without -Locked, then rebuild." }
+        $depsDir = "$($Shared.Files)/official-dependencies"
+        New-Item -ItemType Directory -Force $depsDir | Out-Null
+        $specs = Get-OfficialDependencySpecs (Get-StagingCheckout $Shared.SourceCache $Shared.Repos 'obs-studio')
+        foreach ($spec in $specs) { Get-DownloadedFile $spec.Url "$depsDir/$($spec.FileName)" $spec.Hash }
+        Compress-SourceArchive $Archive $depsDir @($specs.FileName)
+        $entry = [pscustomobject]@{
+            name = 'official-dependencies'; archive = 'official-dependencies.7z'; pin = $obsStudioCommit
+            sha256 = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
+        }
+    }
+    $entry | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ResultFile
 }
 
-# --- Codec source trees (pin = the pinned obs-deps recipes) ----------------
+# --- Codec source trees (pin = the pinned obs-deps recipes) -----------------
 # The obs-deps recipes know where each codec comes from and pin its hash; run
 # their Setup stage (download + unpack, no build) and pack the resulting trees.
-$obsDepsCommit = Get-EntryCommit 'obs-deps'
-$codecArchive = "$SourceCache/codec-sources.7z"
-$codecLocked = Get-LockedDownload $lock 'codec-sources'
-if (!(Test-PackageSelected 'codec-sources') -and $codecLocked) {
-    $downloadEntries.Add($codecLocked)
-} elseif (!(Test-DownloadForced 'codec-sources') -and
-          (Test-CachedEntry -Archive $codecArchive -LockedEntry $codecLocked -Pin $obsDepsCommit -PinField 'pin')) {
-    Write-Host '[SKIP] codec-sources.7z (sources.lock is current)'
-    $downloadEntries.Add($codecLocked)
-} else {
-    if ($Locked) { throw "sources.lock is out of date for 'codec-sources'. Run Download-Sources.ps1 without -Locked, then rebuild." }
-    $work = "$staging/codec"
-    if (!(Test-Path "$work/obs-deps")) { Expand-SourceArchive "$SourceCache/git-obs-deps.7z" $work }
-    Copy-Item "$root/Build-CodecDependencies.ps1" $work -Force
-    New-Item -ItemType Directory -Force "$work/repro" | Out-Null
-    Copy-Item "$root/repro/UpstreamAdapters.ps1" "$work/repro" -Force
-    Push-Location $work
-    try { Exec pwsh -NoProfile -ExecutionPolicy Bypass -File "$work/Build-CodecDependencies.ps1" -DownloadOnly } finally { Pop-Location }
-    Compress-SourceArchive $codecArchive "$work/build" @('codec-sources')
-    $downloadEntries.Add([pscustomobject]@{
-        name = 'codec-sources'; archive = 'codec-sources.7z'; pin = $obsDepsCommit
-        sha256 = (Get-FileHash -LiteralPath $codecArchive -Algorithm SHA256).Hash
-    })
+$codecSourcesTaskBody = {
+    param($LockedEntry, $Archive, $Flags, $DepResultFile, $ResultFile)
+    $obsDepsCommit = [string](Get-Content -LiteralPath $DepResultFile -Raw | ConvertFrom-Json).commit
+    if (!$obsDepsCommit) { throw "sources.lock has no git entry for 'obs-deps'; add it to sources.psd1 and re-run Download-Sources.ps1." }
+    $entry = $null
+    if (!$Flags.Selected -and $LockedEntry) {
+        $entry = $LockedEntry
+    } elseif (!$Flags.Forced -and (Test-CachedEntry -Archive $Archive -LockedEntry $LockedEntry -Pin $obsDepsCommit -PinField 'pin')) {
+        Write-Output '[SKIP] codec-sources.7z (sources.lock is current)'
+        $entry = $LockedEntry
+    } else {
+        if ($Flags.Locked) { throw "sources.lock is out of date for 'codec-sources'. Run Download-Sources.ps1 without -Locked, then rebuild." }
+        $work = "$($Shared.Staging)/codec"
+        if (!(Test-Path "$work/obs-deps")) { Expand-SourceArchive "$($Shared.SourceCache)/git-obs-deps.7z" $work }
+        Copy-Item "$($Shared.Root)/Build-CodecDependencies.ps1" $work -Force
+        New-Item -ItemType Directory -Force "$work/repro" | Out-Null
+        Copy-Item "$($Shared.Root)/repro/UpstreamAdapters.ps1" "$work/repro" -Force
+        Push-Location $work
+        try { Exec pwsh -NoProfile -ExecutionPolicy Bypass -File "$work/Build-CodecDependencies.ps1" -DownloadOnly } finally { Pop-Location }
+        Compress-SourceArchive $Archive "$work/build" @('codec-sources')
+        $entry = [pscustomobject]@{
+            name = 'codec-sources'; archive = 'codec-sources.7z'; pin = $obsDepsCommit
+            sha256 = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
+        }
+    }
+    $entry | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ResultFile
 }
 
+$graph = [ordered]@{}
+foreach ($decl in $declarations) {
+    $graph["git-$($decl.Name)"] = @{
+        Depends = @()
+        Body = $gitTaskBody
+        Args = @(
+            $decl
+            (Get-LockedSource $lock $decl.Name)
+            "$SourceCache/git-$($decl.Name).7z"
+            [pscustomobject]@{
+                Selected = [bool](Test-PackageSelected $decl.Name)
+                Forced = [bool](Test-PackageForced $decl.Name)
+                Force = [bool]$Force
+                Locked = [bool]$Locked
+            }
+            "$resultsDir/git-$($decl.Name).json"
+        )
+    }
+}
+$atl = Get-PinnedAtl
+$atlPin = Get-PinHash ([ordered]@{ base = $atl.Base; files = $atl.Files })
+$graph['atl'] = @{
+    Depends = @()
+    Body = $atlTaskBody
+    Args = @(
+        $atl
+        (Get-LockedDownload $lock 'atl')
+        "$SourceCache/atl.7z"
+        $atlPin
+        [pscustomobject]@{
+            Selected = [bool](Test-PackageSelected 'atl')
+            Forced = [bool](Test-DownloadForced 'atl')
+            Force = [bool]$Force
+            Locked = [bool]$Locked
+        }
+        "$resultsDir/atl.json"
+    )
+}
+$graph['official-dependencies'] = @{
+    Depends = @('git-obs-studio')
+    Body = $depsTaskBody
+    Args = @(
+        (Get-LockedDownload $lock 'official-dependencies')
+        "$SourceCache/official-dependencies.7z"
+        [pscustomobject]@{
+            Selected = [bool](Test-PackageSelected 'official-dependencies')
+            Forced = [bool](Test-DownloadForced 'official-dependencies')
+            Force = [bool]$Force
+            Locked = [bool]$Locked
+        }
+        "$resultsDir/git-obs-studio.json"
+        "$resultsDir/official-dependencies.json"
+    )
+}
+$graph['codec-sources'] = @{
+    Depends = @('git-obs-deps')
+    Body = $codecSourcesTaskBody
+    Args = @(
+        (Get-LockedDownload $lock 'codec-sources')
+        "$SourceCache/codec-sources.7z"
+        [pscustomobject]@{
+            Selected = [bool](Test-PackageSelected 'codec-sources')
+            Forced = [bool](Test-DownloadForced 'codec-sources')
+            Force = [bool]$Force
+            Locked = [bool]$Locked
+        }
+        "$resultsDir/git-obs-deps.json"
+        "$resultsDir/codec-sources.json"
+    )
+}
+$run = Invoke-TaskGraph -Tasks $graph -Prelude $taskPrelude -Shared $shared -ThrottleLimit $ThrottleLimit `
+    -OnLine { param($task, $line) Write-Host "[$task] $line" }
+
+# --- Assemble sources.lock --------------------------------------------------
+$sourceEntries = @($declarations | ForEach-Object {
+    Get-Content -LiteralPath "$resultsDir/git-$($_.Name).json" -Raw | ConvertFrom-Json
+})
+$downloadEntries = @(@('atl', 'official-dependencies', 'codec-sources') | ForEach-Object {
+    Get-Content -LiteralPath "$resultsDir/$_.json" -Raw | ConvertFrom-Json
+})
 $newLock = [pscustomobject]@{
     kind = 'obs-fdk-qsv-sources-lock-v1'
     generated_utc = [DateTime]::UtcNow.ToString('o')
-    sources = $sourceEntries.ToArray()
-    downloads = $downloadEntries.ToArray()
+    sources = $sourceEntries
+    downloads = $downloadEntries
 }
 Write-SourceLock $root $newLock | Out-Null
 if (!$KeepStaging) { Remove-Item -LiteralPath $staging -Recurse -Force }
-Write-Host "Source cache ready: $SourceCache"
+Write-Host "Source cache ready: $SourceCache ($([int]$run.Elapsed.TotalSeconds)s, throttle $ThrottleLimit)"
 Write-Host 'Copy the source-cache directory next to Build-Reproduce.ps1 (or pass -SourceCache) to build offline.'
